@@ -1,0 +1,34 @@
+app:
+  name: go-pq-cdc-pq
+
+server:
+  port: 8080
+
+connector:
+  publication: order_item_feedback_publication
+  table: order_item_feedback
+  schema: public
+  slot: order_item_feedback_slot
+  slot_activity_checker_interval: 3000ms
+  create_if_not_exists: true
+  bulk_size: 10000
+  timeout: 30s
+  max_retries: 3
+  retry_delay: 1s
+  log_level: 1
+  debug_mode: false
+  create_target_table_if_not_exists: true
+  
+postgres:
+  source:
+    host: localhost
+    port: 5432
+    user: source_user
+    password: source_password
+    db: source_db
+  target:
+    host: localhost
+    port: 5432
+    user: target_user
+    password: target_password
+    db: target_db

@@ -1,27 +1,37 @@
 package gopqcdcpq
 
-// Option represents a configuration option
-type Option func(*Config)
+import (
+	"os"
 
-// Config holds the configuration
+	"github.com/Trendyol/go-pq-cdc/pq/publication"
+)
+
+// Config captures user configurable settings for the connector.
 type Config struct {
-	Host     string
-	Port     int
-	Database string
-	User     string
-	Password string
+	ConfigPath        string
+	PublicationTables []publication.Table
 }
 
-// WithHost sets the host option
-func WithHost(host string) Option {
-	return func(c *Config) {
-		c.Host = host
+// Option represents an option for customizing the connector config.
+type Option func(*Config)
+
+func defaultConfig() Config {
+	return Config{
+		ConfigPath: os.Getenv("CONFIG_FILE"),
 	}
 }
 
-// WithPort sets the port option
-func WithPort(port int) Option {
-	return func(c *Config) {
-		c.Port = port
+// WithConfigPath overrides the location of the main configuration file.
+func WithConfigPath(path string) Option {
+	return func(cfg *Config) {
+		cfg.ConfigPath = path
+	}
+}
+
+// WithPublicationTables overrides the publication tables used while creating
+// the CDC publication. When not provided, defaults are used.
+func WithPublicationTables(tables ...publication.Table) Option {
+	return func(cfg *Config) {
+		cfg.PublicationTables = append([]publication.Table(nil), tables...)
 	}
 }

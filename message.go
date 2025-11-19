@@ -1,9 +1,6 @@
 package gopqcdcpq
 
-// Message represents a CDC message
-type Message struct {
-	Topic   string
-	Key     string
-	Value   []byte
-	Headers map[string]string
-}
+import "github.com/Trendyol/go-pq-cdc-pq/pq/connector"
+
+// Message represents a CDC message emitted by the connector.
+type Message = connector.Message
