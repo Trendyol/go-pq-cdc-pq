@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"strconv"
 
-	"github.com/Trendyol/go-pq-cdc-pq/internal/config"
+	"github.com/Trendyol/go-pq-cdc-pq/config"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -40,7 +40,7 @@ type Rows interface {
 }
 
 // TargetDatabasePool creates a new database connection pool for target database
-func TargetDatabasePool(ctx context.Context, cfg *config.Config) (DatabasePool, error) {
+func TargetDatabasePool(ctx context.Context, cfg *config.Connector) (DatabasePool, error) {
 	connString := buildConnString(cfg.Postgres.Target)
 
 	slog.Info("Connecting to PostgreSQL target...", "connString", connString)
@@ -52,7 +52,7 @@ func TargetDatabasePool(ctx context.Context, cfg *config.Config) (DatabasePool, 
 }
 
 // SourceDatabasePool creates a new database connection pool for source database
-func SourceDatabasePool(ctx context.Context, cfg *config.Config) (DatabasePool, error) {
+func SourceDatabasePool(ctx context.Context, cfg *config.Connector) (DatabasePool, error) {
 	connString := buildConnString(cfg.Postgres.Source)
 
 	slog.Info("Connecting to PostgreSQL source...", "connString", connString)

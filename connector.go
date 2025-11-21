@@ -3,101 +3,261 @@ package gopqcdcpq
 import (
 	"context"
 	"fmt"
-	"sync"
+	"log/slog"
 
-	"github.com/Trendyol/go-pq-cdc/pq/publication"
-
-	appconfig "github.com/Trendyol/go-pq-cdc-pq/internal/config"
-	"github.com/Trendyol/go-pq-cdc-pq/pq/app"
+	cdc "github.com/Trendyol/go-pq-cdc"
+	"github.com/Trendyol/go-pq-cdc-pq/config"
+	"github.com/Trendyol/go-pq-cdc-pq/internal/database"
+	"github.com/Trendyol/go-pq-cdc-pq/internal/sqlutil"
+	"github.com/Trendyol/go-pq-cdc-pq/internal/tracer"
+	"github.com/Trendyol/go-pq-cdc/pq/message/format"
+	"github.com/Trendyol/go-pq-cdc/pq/replication"
+	slogctx "github.com/veqryn/slog-context"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
-// Connector orchestrates the CDC lifecycle (initial load + replication listener).
-type Connector struct {
-	cfg       *appconfig.Config
-	closeFn   func(context.Context) error
-	ctx       context.Context
-	cancel    context.CancelFunc
-	tables    []publication.Table
-	stopOnce  sync.Once
-	closeOnce sync.Once
+type Connector interface {
+	Start(ctx context.Context)
+	WaitUntilReady(ctx context.Context) error
+	Close()
 }
 
-// NewConnector constructs a ready-to-run Connector using the provided options.
-func NewConnector(options ...Option) (*Connector, error) {
+type connector struct {
+	cdc           cdc.Connector
+	cfg           *config.Connector
+	targetPQ      *TargetPQ
+	messages      chan Message
+	readyCh       chan struct{}
+	pool          database.DatabasePool
+	primaryKey    string
+	defaultSchema string
+}
+
+func NewConnector(ctx context.Context, cfg *config.Connector, options ...Option) (Connector, error) {
+	cfg.SetDefault()
+
+	// Apply options
 	opts := defaultConfig()
 	for _, option := range options {
 		option(&opts)
 	}
 
-	initCfg := app.InitConfig{
-		ConfigPath: opts.ConfigPath,
+	pqConnector := &connector{
+		cfg:           cfg,
+		readyCh:       make(chan struct{}, 1),
+		primaryKey:    opts.PrimaryKey,
+		defaultSchema: opts.DefaultSchema,
 	}
 
-	cfg, closeFn, tracerCtx, err := app.InitializeApplicationWithConfig(initCfg)
+	// Initialize database pool for target database
+	pool, err := database.TargetDatabasePool(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize application: %w", err)
+		return nil, fmt.Errorf("failed to create database pool: %w", err)
 	}
+	pqConnector.pool = pool
 
-	ctx, cancel := context.WithCancel(tracerCtx)
+	// Create message channel
+	pqConnector.messages = make(chan Message, cfg.ConnectorConfig.BulkSize)
 
-	tables := opts.PublicationTables
-	if len(tables) == 0 {
-		tables = app.CreatePublicationTables(cfg)
+	// Create target query executor
+	batchConfig := config.BatchConfig{
+		BulkSize:   cfg.BatchConfig.BulkSize,
+		Timeout:    cfg.BatchConfig.Timeout,
+		MaxRetries: cfg.BatchConfig.MaxRetries,
+		RetryDelay: cfg.BatchConfig.RetryDelay,
 	}
+	pqConnector.targetPQ = NewTargetPQ(
+		pool,
+		batchConfig,
+		slog.Default().With("component", "TargetPQ"),
+	)
 
-	return &Connector{
-		cfg:     cfg,
-		closeFn: closeFn,
-		ctx:     ctx,
-		cancel:  cancel,
-		tables:  tables,
-	}, nil
+	// Build CDC configuration
+
+	// Create CDC connector
+	pqCDC, err := cdc.NewConnector(ctx, cfg.CDC, pqConnector.listener)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create CDC connector: %w", err)
+	}
+	pqConnector.cdc = pqCDC
+
+	return pqConnector, nil
 }
 
-// Context returns the long-lived context used by the connector runtime.
-func (c *Connector) Context() context.Context {
-	if c == nil {
-		return context.Background()
-	}
-	return c.ctx
+func (c *connector) Start(ctx context.Context) {
+	go func() {
+		log := slogctx.FromCtx(ctx)
+		log.Info("waiting for connector start...")
+
+		if err := c.cdc.WaitUntilReady(ctx); err != nil {
+			panic(err)
+		}
+
+		log.Info("bulk process started")
+
+		// Start target query executor
+		targetCtx := slogctx.Append(ctx, "component", "TargetPQ")
+		// Convert Message channel to pqconnector.Message channel
+		pqMessages := make(chan Message, cap(c.messages))
+		go func() {
+			for msg := range c.messages {
+				pqMessages <- Message{
+					Query: msg.Query,
+					Args:  msg.Args,
+					Ack:   msg.Ack,
+				}
+			}
+			close(pqMessages)
+		}()
+		go c.targetPQ.Start(targetCtx, pqMessages)
+
+		c.readyCh <- struct{}{}
+	}()
+
+	c.cdc.Start(ctx)
 }
 
-// Start boots the CDC service. Typically executed inside a goroutine.
-func (c *Connector) Start() error {
-	if c == nil {
-		return fmt.Errorf("connector is nil")
+func (c *connector) WaitUntilReady(ctx context.Context) error {
+	select {
+	case <-c.readyCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return app.StartService(c.ctx, c.cfg, c.tables)
 }
 
-// Stop requests a graceful shutdown by cancelling the connector context.
-func (c *Connector) Stop() {
-	if c == nil || c.cancel == nil {
+func (c *connector) Close() {
+	if !isClosed(c.readyCh) {
+		close(c.readyCh)
+	}
+	c.cdc.Close()
+	close(c.messages)
+	if c.pool != nil {
+		c.pool.Close()
+	}
+}
+
+func (c *connector) listener(ctx *replication.ListenerContext) {
+	// Handle keepalive messages
+	if ctx.Message == nil {
 		return
 	}
-	c.stopOnce.Do(func() {
-		c.cancel()
-	})
+
+	// Create a new root span for each CDC message processing
+	msgCtx, span := tracer.StartSpan(context.Background(), "cdc.message_received",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("message.type", fmt.Sprintf("%T", ctx.Message)),
+		))
+	defer span.End()
+
+	// Process the message
+	c.processMessage(msgCtx, ctx)
+
+	span.SetStatus(codes.Ok, "CDC message processing completed")
 }
 
-// Shutdown stops the connector and releases telemetry resources.
-func (c *Connector) Shutdown(ctx context.Context) error {
-	if c == nil {
-		return nil
-	}
+func (c *connector) processMessage(ctx context.Context, replCtx *replication.ListenerContext) {
+	log := slogctx.FromCtx(ctx)
 
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	// Start span for message processing
+	ctx, span := tracer.StartSpanWithAttrs(ctx, "replication.process_message")
+	defer span.End()
 
-	c.Stop()
+	log.Debug("Processing replication message", "messageType", fmt.Sprintf("%T", replCtx.Message))
 
-	var err error
-	c.closeOnce.Do(func() {
-		if c.closeFn != nil {
-			err = c.closeFn(ctx)
+	switch msg := replCtx.Message.(type) {
+	case *format.Insert:
+		c.processInsertMessage(ctx, msg, replCtx.Ack)
+
+	case *format.Delete:
+		c.processDeleteMessage(ctx, msg, replCtx.Ack)
+
+	case *format.Update:
+		c.processUpdateMessage(ctx, msg, replCtx.Ack)
+
+	case *format.Relation:
+		log.Debug("Relation message received",
+			"namespace", msg.Namespace,
+			"table", msg.Name,
+			"columns", len(msg.Columns))
+		if replCtx.Ack != nil {
+			replCtx.Ack()
 		}
-	})
 
-	return err
+	default:
+		log.Warn("Unknown message type received",
+			"type", fmt.Sprintf("%T", msg),
+			"message", msg)
+	}
+
+	span.SetStatus(codes.Ok, "Message processed successfully")
+}
+
+func (c *connector) processInsertMessage(ctx context.Context, msg *format.Insert, ack func() error) {
+
+	msgObj := NewInsertMessage(msg)
+	// Set internal fields for target database query processing
+	querySQL, args := sqlutil.BuildUpsertQuery(msg.TableName, msg.Decoded, c.primaryKey)
+	msgObj.Query = querySQL
+	msgObj.Args = args
+	msgObj.Ack = ack
+	msgObj.Schema = c.defaultSchema
+	msgObj.Table = msg.TableName
+	msgObj.Action = "INSERT"
+	msgObj.OldKeys = nil
+	msgObj.NewValues = msg.Decoded
+
+	c.sendMessage(*msgObj)
+
+}
+
+func (c *connector) processDeleteMessage(ctx context.Context, msg *format.Delete, ack func() error) {
+	msgObj := NewDeleteMessage(msg)
+	// Set internal fields for target database query processing
+	querySQL, args := sqlutil.BuildDeleteQuery(msg.TableName, msg.OldDecoded, c.primaryKey)
+	msgObj.Query = querySQL
+	msgObj.Args = args
+	msgObj.Ack = ack
+	msgObj.Schema = c.defaultSchema
+	msgObj.Table = msg.TableName
+	msgObj.Action = "DELETE"
+	msgObj.OldKeys = msg.OldDecoded
+	msgObj.NewValues = nil
+
+	c.sendMessage(*msgObj)
+
+}
+
+func (c *connector) processUpdateMessage(ctx context.Context, msg *format.Update, ack func() error) {
+
+	msgObj := NewUpdateMessage(msg)
+	// Set internal fields for target database query processing
+	querySQL, args := sqlutil.BuildUpsertQuery(msg.TableName, msg.NewDecoded, c.primaryKey)
+	msgObj.Query = querySQL
+	msgObj.Args = args
+	msgObj.Ack = ack
+	msgObj.Schema = c.defaultSchema
+	msgObj.Table = msg.TableName
+	msgObj.Action = "UPDATE"
+	msgObj.OldKeys = msg.OldDecoded
+	msgObj.NewValues = msg.NewDecoded
+
+	c.sendMessage(*msgObj)
+
+}
+
+func (c *connector) sendMessage(message Message) {
+	c.messages <- message
+}
+
+func isClosed[T any](ch <-chan T) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+	}
+	return false
 }
