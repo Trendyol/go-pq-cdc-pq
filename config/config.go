@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Trendyol/go-pq-cdc/config"
+	"github.com/Trendyol/go-pq-cdc/pq/publication"
 	"gopkg.in/yaml.v3"
 )
 
@@ -52,6 +53,7 @@ type ConnectorConfig struct {
 	DebugMode                    bool          `yaml:"debug_mode"`
 	LogLevel                     int           `yaml:"log_level"`
 	CreateTargetTableIfNotExists bool          `yaml:"create_target_table_if_not_exists"`
+	ReplicaIdentity              string        `yaml:"replica_identity"` // DEFAULT or FULL
 }
 
 // PostgresConfig carries both source and target database configurations.
@@ -109,6 +111,69 @@ func (c *Connector) SetDefault() {
 
 	if c.ConnectorConfig.SlotActivityCheckerInterval == 0 {
 		c.ConnectorConfig.SlotActivityCheckerInterval = 3 * time.Second
+	}
+
+	// Populate CDC config from Postgres source and Connector config
+	if c.CDC.Host == "" {
+		c.CDC.Host = c.Postgres.Source.Host
+	}
+	if c.CDC.Username == "" {
+		c.CDC.Username = c.Postgres.Source.User
+	}
+	if c.CDC.Password == "" {
+		c.CDC.Password = c.Postgres.Source.Password
+	}
+	if c.CDC.Database == "" {
+		c.CDC.Database = c.Postgres.Source.DB
+	}
+	if c.CDC.Publication.Name == "" {
+		c.CDC.Publication.Name = c.ConnectorConfig.Publication
+	}
+	if !c.CDC.Publication.CreateIfNotExists {
+		c.CDC.Publication.CreateIfNotExists = c.ConnectorConfig.CreateIfNotExists
+	}
+	// Set default ReplicaIdentity if not specified
+	if c.ConnectorConfig.ReplicaIdentity == "" {
+		c.ConnectorConfig.ReplicaIdentity = "DEFAULT"
+	}
+
+	// Populate Publication Tables if empty
+	if len(c.CDC.Publication.Tables) == 0 && c.ConnectorConfig.Table != "" {
+		schema := c.ConnectorConfig.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		c.CDC.Publication.Tables = publication.Tables{
+			{
+				Name:            c.ConnectorConfig.Table,
+				Schema:          schema,
+				ReplicaIdentity: c.ConnectorConfig.ReplicaIdentity,
+			},
+		}
+	}
+
+	// Ensure ReplicaIdentity is set for all tables
+	for i := range c.CDC.Publication.Tables {
+		if c.CDC.Publication.Tables[i].ReplicaIdentity == "" {
+			c.CDC.Publication.Tables[i].ReplicaIdentity = c.ConnectorConfig.ReplicaIdentity
+		}
+	}
+	// Populate Publication Operations if empty (default: INSERT, UPDATE, DELETE)
+	if len(c.CDC.Publication.Operations) == 0 {
+		c.CDC.Publication.Operations = publication.Operations{
+			publication.OperationInsert,
+			publication.OperationUpdate,
+			publication.OperationDelete,
+		}
+	}
+	if c.CDC.Slot.Name == "" {
+		c.CDC.Slot.Name = c.ConnectorConfig.Slot
+	}
+	if c.CDC.Slot.SlotActivityCheckerInterval == 0 {
+		c.CDC.Slot.SlotActivityCheckerInterval = c.ConnectorConfig.SlotActivityCheckerInterval
+	}
+	if !c.CDC.Slot.CreateIfNotExists {
+		c.CDC.Slot.CreateIfNotExists = c.ConnectorConfig.CreateIfNotExists
 	}
 
 	// Set CDC config defaults if needed

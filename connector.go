@@ -4,33 +4,31 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
 
 	cdc "github.com/Trendyol/go-pq-cdc"
 	"github.com/Trendyol/go-pq-cdc-pq/config"
 	"github.com/Trendyol/go-pq-cdc-pq/internal/database"
 	"github.com/Trendyol/go-pq-cdc-pq/internal/sqlutil"
-	"github.com/Trendyol/go-pq-cdc-pq/internal/tracer"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/Trendyol/go-pq-cdc/pq/replication"
 	slogctx "github.com/veqryn/slog-context"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/trace"
 )
 
 type Connector interface {
 	Start(ctx context.Context)
-	WaitUntilReady(ctx context.Context) error
+	WaitForShutdown(ctx context.Context) error
 	Close()
 }
 
 type connector struct {
 	cdc           cdc.Connector
 	cfg           *config.Connector
-	targetPQ      *TargetPQ
+	sink          *Sink
 	messages      chan Message
-	readyCh       chan struct{}
-	pool          database.DatabasePool
+	pool          database.Pool
 	primaryKey    string
 	defaultSchema string
 }
@@ -46,13 +44,12 @@ func NewConnector(ctx context.Context, cfg *config.Connector, options ...Option)
 
 	pqConnector := &connector{
 		cfg:           cfg,
-		readyCh:       make(chan struct{}, 1),
 		primaryKey:    opts.PrimaryKey,
 		defaultSchema: opts.DefaultSchema,
 	}
 
 	// Initialize database pool for target database
-	pool, err := database.TargetDatabasePool(ctx, cfg)
+	pool, err := database.NewTargetPool(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create database pool: %w", err)
 	}
@@ -61,17 +58,17 @@ func NewConnector(ctx context.Context, cfg *config.Connector, options ...Option)
 	// Create message channel
 	pqConnector.messages = make(chan Message, cfg.ConnectorConfig.BulkSize)
 
-	// Create target query executor
+	// Create sink
 	batchConfig := config.BatchConfig{
 		BulkSize:   cfg.BatchConfig.BulkSize,
 		Timeout:    cfg.BatchConfig.Timeout,
 		MaxRetries: cfg.BatchConfig.MaxRetries,
 		RetryDelay: cfg.BatchConfig.RetryDelay,
 	}
-	pqConnector.targetPQ = NewTargetPQ(
+	pqConnector.sink = NewSink(
 		pool,
 		batchConfig,
-		slog.Default().With("component", "TargetPQ"),
+		slog.Default().With("component", "Sink"),
 	)
 
 	// Build CDC configuration
@@ -97,8 +94,8 @@ func (c *connector) Start(ctx context.Context) {
 
 		log.Info("bulk process started")
 
-		// Start target query executor
-		targetCtx := slogctx.Append(ctx, "component", "TargetPQ")
+		// Start sink
+		sinkCtx := slogctx.Append(ctx, "component", "Sink")
 		// Convert Message channel to pqconnector.Message channel
 		pqMessages := make(chan Message, cap(c.messages))
 		go func() {
@@ -111,17 +108,20 @@ func (c *connector) Start(ctx context.Context) {
 			}
 			close(pqMessages)
 		}()
-		go c.targetPQ.Start(targetCtx, pqMessages)
-
-		c.readyCh <- struct{}{}
+		go c.sink.Start(sinkCtx, pqMessages)
 	}()
 
 	c.cdc.Start(ctx)
 }
 
-func (c *connector) WaitUntilReady(ctx context.Context) error {
+func (c *connector) WaitForShutdown(ctx context.Context) error {
+	log := slogctx.FromCtx(ctx)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
 	select {
-	case <-c.readyCh:
+	case sig := <-sigChan:
+		log.Info("shutdown signal received", "signal", sig.String())
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -129,9 +129,6 @@ func (c *connector) WaitUntilReady(ctx context.Context) error {
 }
 
 func (c *connector) Close() {
-	if !isClosed(c.readyCh) {
-		close(c.readyCh)
-	}
 	c.cdc.Close()
 	close(c.messages)
 	if c.pool != nil {
@@ -145,26 +142,12 @@ func (c *connector) listener(ctx *replication.ListenerContext) {
 		return
 	}
 
-	// Create a new root span for each CDC message processing
-	msgCtx, span := tracer.StartSpan(context.Background(), "cdc.message_received",
-		trace.WithSpanKind(trace.SpanKindConsumer),
-		trace.WithAttributes(
-			attribute.String("message.type", fmt.Sprintf("%T", ctx.Message)),
-		))
-	defer span.End()
-
 	// Process the message
-	c.processMessage(msgCtx, ctx)
-
-	span.SetStatus(codes.Ok, "CDC message processing completed")
+	c.processMessage(context.Background(), ctx)
 }
 
 func (c *connector) processMessage(ctx context.Context, replCtx *replication.ListenerContext) {
 	log := slogctx.FromCtx(ctx)
-
-	// Start span for message processing
-	ctx, span := tracer.StartSpanWithAttrs(ctx, "replication.process_message")
-	defer span.End()
 
 	log.Debug("Processing replication message", "messageType", fmt.Sprintf("%T", replCtx.Message))
 
@@ -192,8 +175,6 @@ func (c *connector) processMessage(ctx context.Context, replCtx *replication.Lis
 			"type", fmt.Sprintf("%T", msg),
 			"message", msg)
 	}
-
-	span.SetStatus(codes.Ok, "Message processed successfully")
 }
 
 func (c *connector) processInsertMessage(ctx context.Context, msg *format.Insert, ack func() error) {
@@ -251,13 +232,4 @@ func (c *connector) processUpdateMessage(ctx context.Context, msg *format.Update
 
 func (c *connector) sendMessage(message Message) {
 	c.messages <- message
-}
-
-func isClosed[T any](ch <-chan T) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-	}
-	return false
 }

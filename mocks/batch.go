@@ -2,13 +2,13 @@ package mocks
 
 import (
 	"context"
-	"github.com/Trendyol/go-pq-cdc-pq/internal/database"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/mock"
 )
 
-// MockDatabasePool is a mock implementation of DatabasePool interface
+// MockDatabasePool is a mock implementation of Pool interface
 type MockDatabasePool struct {
 	mock.Mock
 }
@@ -31,11 +31,6 @@ func (m *MockDatabasePool) Query(ctx context.Context, sql string, args ...any) (
 func (m *MockDatabasePool) Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
 	mockArgs := m.Called(ctx, sql, arguments)
 	return mockArgs.Get(0).(pgconn.CommandTag), mockArgs.Error(1)
-}
-
-func (m *MockDatabasePool) Begin(ctx context.Context) (database.DatabaseTx, error) {
-	mockArgs := m.Called(ctx)
-	return mockArgs.Get(0).(database.DatabaseTx), mockArgs.Error(1)
 }
 
 func (m *MockDatabasePool) Close() {
