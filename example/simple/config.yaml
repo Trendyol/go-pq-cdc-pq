@@ -43,4 +43,9 @@ batch:
 cdc:
   metric:
     port: 8080
-
+  snapshot:
+    enabled: true
+    mode: initial
+    chunkSize: 10000
+    claimTimeout: 30s
+    heartbeatInterval: 10s

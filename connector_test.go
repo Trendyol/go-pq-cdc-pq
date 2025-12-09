@@ -325,6 +325,98 @@ func TestConnectorProcessMessageDelete(t *testing.T) {
 	}
 }
 
+func TestConnectorProcessSnapshotDataMessage(t *testing.T) {
+	ctx := context.Background()
+	cfg := createTestConfig()
+	messages := make(chan Message, 10)
+
+	conn := &connector{
+		cfg:           cfg,
+		messages:      messages,
+		primaryKey:    "id",
+		defaultSchema: "public",
+	}
+
+	ackCalled := false
+	ack := func() error {
+		ackCalled = true
+		return nil
+	}
+
+	snapshotMsg := &format.Snapshot{
+		EventType: format.SnapshotEventTypeData,
+		Table:     "users",
+		Schema:    "public",
+		Data: map[string]any{
+			"id":   1,
+			"name": "snapshot",
+		},
+	}
+
+	conn.processSnapshotMessage(ctx, snapshotMsg, ack)
+
+	select {
+	case msg := <-messages:
+		assert.Equal(t, "users", msg.Table)
+		assert.Equal(t, "public", msg.Schema)
+		assert.Equal(t, "SNAPSHOT", msg.Action)
+		assert.Equal(t, SnapshotMessage, msg.Type)
+		assert.NotEmpty(t, msg.Query)
+		assert.NotNil(t, msg.NewValues)
+		assert.Equal(t, snapshotMsg.Data, msg.NewValues)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal(msgNotReceived)
+	}
+
+	assert.False(t, ackCalled, "snapshot data ack should be deferred to sink")
+}
+
+func TestConnectorProcessSnapshotBeginAck(t *testing.T) {
+	ctx := context.Background()
+	cfg := createTestConfig()
+
+	conn := &connector{
+		cfg: cfg,
+	}
+
+	ackCalled := false
+	ack := func() error {
+		ackCalled = true
+		return nil
+	}
+
+	snapshotMsg := &format.Snapshot{
+		EventType: format.SnapshotEventTypeBegin,
+	}
+
+	conn.processSnapshotMessage(ctx, snapshotMsg, ack)
+
+	assert.True(t, ackCalled, "snapshot begin should be acked immediately")
+}
+
+func TestConnectorProcessSnapshotEndAck(t *testing.T) {
+	ctx := context.Background()
+	cfg := createTestConfig()
+
+	conn := &connector{
+		cfg: cfg,
+	}
+
+	ackCalled := false
+	ack := func() error {
+		ackCalled = true
+		return nil
+	}
+
+	snapshotMsg := &format.Snapshot{
+		EventType: format.SnapshotEventTypeEnd,
+	}
+
+	conn.processSnapshotMessage(ctx, snapshotMsg, ack)
+
+	assert.True(t, ackCalled, "snapshot end should be acked immediately")
+}
+
 func TestConnectorProcessMessageRelation(t *testing.T) {
 	ctx := context.Background()
 	cfg := createTestConfig()

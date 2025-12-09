@@ -13,6 +13,7 @@
 
 # Dependency directories
 vendor/
+.cache/
 
 # Go workspace file
 go.work
