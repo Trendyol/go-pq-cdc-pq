@@ -161,6 +161,9 @@ func (c *connector) processMessage(ctx context.Context, replCtx *replication.Lis
 	case *format.Update:
 		c.processUpdateMessage(ctx, msg, replCtx.Ack)
 
+	case *format.Snapshot:
+		c.processSnapshotMessage(ctx, msg, replCtx.Ack)
+
 	case *format.Relation:
 		log.Debug("Relation message received",
 			"namespace", msg.Namespace,
@@ -210,6 +213,52 @@ func (c *connector) processDeleteMessage(ctx context.Context, msg *format.Delete
 
 	c.sendMessage(*msgObj)
 
+}
+
+func (c *connector) processSnapshotMessage(ctx context.Context, msg *format.Snapshot, ack func() error) {
+	log := slogctx.FromCtx(ctx)
+
+	switch msg.EventType {
+	case format.SnapshotEventTypeBegin:
+		log.Info("snapshot started", "lsn", msg.LSN.String(), "totalRows", msg.TotalRows)
+		if ack != nil {
+			if err := ack(); err != nil {
+				log.Error("failed to ack snapshot begin", "error", err)
+			}
+		}
+		return
+
+	case format.SnapshotEventTypeEnd:
+		log.Info("snapshot completed", "lsn", msg.LSN.String(), "isLast", msg.IsLast)
+		if ack != nil {
+			if err := ack(); err != nil {
+				log.Error("failed to ack snapshot end", "error", err)
+			}
+		}
+		return
+
+	case format.SnapshotEventTypeData:
+		msgObj := NewSnapshotMessage(msg)
+		querySQL, args := sqlutil.BuildUpsertQuery(msg.Table, msg.Data, c.primaryKey)
+		msgObj.Query = querySQL
+		msgObj.Args = args
+		msgObj.Ack = ack
+		msgObj.Schema = c.defaultSchema
+		msgObj.Table = msg.Table
+		msgObj.Action = "SNAPSHOT"
+		msgObj.OldKeys = nil
+		msgObj.NewValues = msg.Data
+		c.sendMessage(*msgObj)
+		return
+
+	default:
+		log.Warn("unknown snapshot event type", "eventType", msg.EventType)
+		if ack != nil {
+			if err := ack(); err != nil {
+				log.Error("failed to ack unknown snapshot event", "error", err)
+			}
+		}
+	}
 }
 
 func (c *connector) processUpdateMessage(ctx context.Context, msg *format.Update, ack func() error) {

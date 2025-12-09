@@ -180,6 +180,9 @@ func (c *Connector) SetDefault() {
 	if c.CDC.Metric.Port == 0 {
 		c.CDC.Metric.Port = c.Server.Port
 	}
+
+	// Ensure underlying CDC config applies its own defaults (snapshot, logger, etc.).
+	c.CDC.SetDefault()
 }
 
 // Config is an alias for Connector to maintain backward compatibility
