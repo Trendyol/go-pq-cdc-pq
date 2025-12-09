@@ -23,3 +23,13 @@ ALTER TABLE public.users REPLICA IDENTITY DEFAULT;
 GRANT ALL PRIVILEGES ON TABLE public.users TO source_user;
 GRANT USAGE, SELECT ON SEQUENCE users_id_seq TO source_user;
 
+INSERT INTO public.users (name, email)
+SELECT
+    -- Rastgele İsim Oluşturma (örneğin: User_1, User_2, ...)
+    'User_' || i::text AS name,
+
+    -- Rastgele E-posta Oluşturma (örneğin: user_1@example.com, user_2@example.com, ...)
+    'user_' || i::text || '@example.com' AS email
+FROM
+    -- 1'den 10000'e kadar bir seri oluştur
+    generate_series(1, 10000) AS i;

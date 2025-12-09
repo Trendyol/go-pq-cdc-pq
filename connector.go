@@ -88,12 +88,6 @@ func (c *connector) Start(ctx context.Context) {
 		log := slogctx.FromCtx(ctx)
 		log.Info("waiting for connector start...")
 
-		if err := c.cdc.WaitUntilReady(ctx); err != nil {
-			panic(err)
-		}
-
-		log.Info("bulk process started")
-
 		// Start sink
 		sinkCtx := slogctx.Append(ctx, "component", "Sink")
 		// Convert Message channel to pqconnector.Message channel

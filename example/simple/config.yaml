@@ -11,7 +11,7 @@ connector:
   slot: simple_slot
   slot_activity_checker_interval: 3000ms
   create_if_not_exists: true
-  bulk_size: 10000
+  bulk_size: 1000
   timeout: 30s
   max_retries: 3
   retry_delay: 1s
@@ -35,8 +35,8 @@ postgres:
     db: cdc_db
 
 batch:
-  bulk_size: 10000
-  timeout: 30s
+  bulk_size: 1000
+  timeout: 1s
   max_retries: 3
   retry_delay: 1s
 
@@ -46,6 +46,6 @@ cdc:
   snapshot:
     enabled: true
     mode: initial
-    chunkSize: 10000
+    chunkSize: 1000
     claimTimeout: 30s
     heartbeatInterval: 10s

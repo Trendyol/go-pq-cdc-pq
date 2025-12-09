@@ -12,10 +12,10 @@ import (
 
 // BatchConfig holds configuration for batch processing
 type BatchConfig struct {
-	BulkSize   int
-	Timeout    time.Duration
-	MaxRetries int
-	RetryDelay time.Duration
+	BulkSize   int           `yaml:"bulk_size"`
+	Timeout    time.Duration `yaml:"timeout"`
+	MaxRetries int           `yaml:"max_retries"`
+	RetryDelay time.Duration `yaml:"retry_delay"`
 }
 
 // Connector represents the complete connector configuration
