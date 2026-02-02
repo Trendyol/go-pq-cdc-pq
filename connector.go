@@ -178,7 +178,8 @@ func (c *connector) processInsertMessage(ctx context.Context, msg *format.Insert
 
 	msgObj := NewInsertMessage(msg)
 	// Set internal fields for target database query processing
-	querySQL, args := sqlutil.BuildUpsertQuery(msg.TableName, msg.Decoded, c.primaryKey)
+	primaryKey := c.resolvePrimaryKey(msg.TableName)
+	querySQL, args := sqlutil.BuildUpsertQuery(msg.TableName, msg.Decoded, primaryKey)
 	msgObj.Query = querySQL
 	msgObj.Args = args
 	msgObj.Ack = ack
@@ -195,7 +196,8 @@ func (c *connector) processInsertMessage(ctx context.Context, msg *format.Insert
 func (c *connector) processDeleteMessage(ctx context.Context, msg *format.Delete, ack func() error) {
 	msgObj := NewDeleteMessage(msg)
 	// Set internal fields for target database query processing
-	querySQL, args := sqlutil.BuildDeleteQuery(msg.TableName, msg.OldDecoded, c.primaryKey)
+	primaryKey := c.resolvePrimaryKey(msg.TableName)
+	querySQL, args := sqlutil.BuildDeleteQuery(msg.TableName, msg.OldDecoded, primaryKey)
 	msgObj.Query = querySQL
 	msgObj.Args = args
 	msgObj.Ack = ack
@@ -233,7 +235,8 @@ func (c *connector) processSnapshotMessage(ctx context.Context, msg *format.Snap
 
 	case format.SnapshotEventTypeData:
 		msgObj := NewSnapshotMessage(msg)
-		querySQL, args := sqlutil.BuildUpsertQuery(msg.Table, msg.Data, c.primaryKey)
+		primaryKey := c.resolvePrimaryKey(msg.Table)
+		querySQL, args := sqlutil.BuildUpsertQuery(msg.Table, msg.Data, primaryKey)
 		msgObj.Query = querySQL
 		msgObj.Args = args
 		msgObj.Ack = ack
@@ -259,7 +262,8 @@ func (c *connector) processUpdateMessage(ctx context.Context, msg *format.Update
 
 	msgObj := NewUpdateMessage(msg)
 	// Set internal fields for target database query processing
-	querySQL, args := sqlutil.BuildUpsertQuery(msg.TableName, msg.NewDecoded, c.primaryKey)
+	primaryKey := c.resolvePrimaryKey(msg.TableName)
+	querySQL, args := sqlutil.BuildUpsertQuery(msg.TableName, msg.NewDecoded, primaryKey)
 	msgObj.Query = querySQL
 	msgObj.Args = args
 	msgObj.Ack = ack
@@ -275,4 +279,16 @@ func (c *connector) processUpdateMessage(ctx context.Context, msg *format.Update
 
 func (c *connector) sendMessage(message Message) {
 	c.messages <- message
+}
+
+func (c *connector) resolvePrimaryKey(tableName string) string {
+	if c.cfg.TablePrimaryKeys == nil {
+		return c.primaryKey
+	}
+	if pk, ok := c.cfg.TablePrimaryKeys[tableName]; ok {
+		if pk != "" {
+			return pk
+		}
+	}
+	return c.primaryKey
 }

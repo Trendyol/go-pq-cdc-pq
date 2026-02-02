@@ -20,12 +20,13 @@ type BatchConfig struct {
 
 // Connector represents the complete connector configuration
 type Connector struct {
-	CDC             config.Config   `yaml:"cdc" mapstructure:"cdc"`
-	App             AppConfig       `yaml:"app"`
-	Server          ServerConfig    `yaml:"server"`
-	Postgres        PostgresConfig  `yaml:"postgres"`
-	ConnectorConfig ConnectorConfig `yaml:"connector"`
-	BatchConfig     BatchConfig     `yaml:"batch"`
+	CDC              config.Config     `yaml:"cdc" mapstructure:"cdc"`
+	App              AppConfig         `yaml:"app"`
+	Server           ServerConfig      `yaml:"server"`
+	Postgres         PostgresConfig    `yaml:"postgres"`
+	ConnectorConfig  ConnectorConfig   `yaml:"connector"`
+	BatchConfig      BatchConfig       `yaml:"batch"`
+	TablePrimaryKeys map[string]string `yaml:"tablePrimaryKeys" mapstructure:"tablePrimaryKeys"`
 }
 
 // AppConfig holds basic application metadata.

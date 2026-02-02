@@ -12,6 +12,7 @@ type Config struct {
 	PublicationTables []publication.Table
 	PrimaryKey        string
 	DefaultSchema     string
+	TablePrimaryKeys  map[string]string
 }
 
 // Option represents an option for customizing the connector config.
@@ -19,9 +20,10 @@ type Option func(*Config)
 
 func defaultConfig() Config {
 	return Config{
-		ConfigPath:    os.Getenv("CONFIG_FILE"),
-		PrimaryKey:    "id",
-		DefaultSchema: "public",
+		ConfigPath:       os.Getenv("CONFIG_FILE"),
+		PrimaryKey:       "id",
+		DefaultSchema:    "public",
+		TablePrimaryKeys: make(map[string]string),
 	}
 }
 
@@ -45,6 +47,16 @@ func WithPublicationTables(tables ...publication.Table) Option {
 func WithPrimaryKey(primaryKey string) Option {
 	return func(cfg *Config) {
 		cfg.PrimaryKey = primaryKey
+	}
+}
+
+// WithTablePrimaryKeys overrides the default primary key per table.
+// Keys are table names (for example: "fake_content_analysis") and
+// values are the corresponding primary key column names.
+// When not provided for a table, the default PrimaryKey is used.
+func WithTablePrimaryKeys(primaryKeys map[string]string) Option {
+	return func(cfg *Config) {
+		cfg.TablePrimaryKeys = primaryKeys
 	}
 }
 

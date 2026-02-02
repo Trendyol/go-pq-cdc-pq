@@ -20,6 +20,11 @@ connector:
   create_target_table_if_not_exists: true
   replica_identity: DEFAULT  # DEFAULT or FULL
 
+tablePrimaryKeys:
+  crash_test: id
+  crash_test2: id
+  mock_data_table: id_pk
+
 postgres:
   source:
     host: 127.0.0.1
