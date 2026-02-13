@@ -12,11 +12,10 @@ import (
 
 // BatchConfig holds configuration for batch processing
 type BatchConfig struct {
-	BulkSize     int           `yaml:"bulk_size"`
-	Timeout      time.Duration `yaml:"timeout"`
-	MaxRetries   int           `yaml:"max_retries"`
-	RetryDelay   time.Duration `yaml:"retry_delay"`
-	RetryEnabled bool          `yaml:"retry_enabled"`
+	BulkSize   int           `yaml:"bulk_size"`
+	Timeout    time.Duration `yaml:"timeout"`
+	MaxRetries int           `yaml:"max_retries"`
+	RetryDelay time.Duration `yaml:"retry_delay"`
 }
 
 // Connector represents the complete connector configuration
@@ -52,7 +51,6 @@ type ConnectorConfig struct {
 	Timeout                      time.Duration `yaml:"timeout"`
 	MaxRetries                   int           `yaml:"max_retries"`
 	RetryDelay                   time.Duration `yaml:"retry_delay"`
-	RetryEnabled                 bool          `yaml:"retry_enabled"`
 	DebugMode                    bool          `yaml:"debug_mode"`
 	LogLevel                     int           `yaml:"log_level"`
 	CreateTargetTableIfNotExists bool          `yaml:"create_target_table_if_not_exists"`

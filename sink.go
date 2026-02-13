@@ -88,7 +88,7 @@ func (s *Sink) enqueue(message Message) {
 }
 
 // flush executes all buffered statements in a single batch transaction.
-// Uses retry logic with exponential backoff when RetryEnabled is true.
+// Uses retry logic with exponential backoff.
 // Acknowledges the last message on success. Clears the queue after execution (success or failure).
 func (s *Sink) flush(ctx context.Context) {
 	if len(s.queue) == 0 {
@@ -100,19 +100,13 @@ func (s *Sink) flush(ctx context.Context) {
 
 	ctx = slogctx.Append(ctx,
 		"queryCount", queryCount,
-		"retryEnabled", s.config.RetryEnabled,
 		"maxRetries", s.config.MaxRetries)
 
 	log.Info("flushing CDC statements to target database")
 
 	lastAck := s.acks[len(s.acks)-1]
 
-	var err error
-	if s.config.RetryEnabled {
-		err = s.executeWithRetry(ctx, s.queue, lastAck)
-	} else {
-		err = s.executeBatch(ctx, s.queue, lastAck)
-	}
+	err := s.executeWithRetry(ctx, s.queue, lastAck)
 
 	if err != nil {
 		log.Error("failed to flush CDC statements to target database",

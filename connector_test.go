@@ -23,11 +23,10 @@ func createTestConfig() *config.Connector {
 			BulkSize: 100,
 		},
 		BatchConfig: config.BatchConfig{
-			BulkSize:     100,
-			Timeout:      time.Second,
-			MaxRetries:   3,
-			RetryDelay:   time.Millisecond * 100,
-			RetryEnabled: true,
+			BulkSize:   100,
+			Timeout:    time.Second,
+			MaxRetries: 3,
+			RetryDelay: time.Millisecond * 100,
 		},
 		Postgres: config.PostgresConfig{
 			Target: config.DatabaseConfig{
@@ -67,11 +66,10 @@ func TestConnectorStart(t *testing.T) {
 
 	// Create sink with mock pool
 	batchConfig := config.BatchConfig{
-		BulkSize:     cfg.BatchConfig.BulkSize,
-		Timeout:      cfg.BatchConfig.Timeout,
-		MaxRetries:   cfg.BatchConfig.MaxRetries,
-		RetryDelay:   cfg.BatchConfig.RetryDelay,
-		RetryEnabled: cfg.BatchConfig.RetryEnabled,
+		BulkSize:   cfg.BatchConfig.BulkSize,
+		Timeout:    cfg.BatchConfig.Timeout,
+		MaxRetries: cfg.BatchConfig.MaxRetries,
+		RetryDelay: cfg.BatchConfig.RetryDelay,
 	}
 	conn.sink = NewSink(mockPool, batchConfig, nil)
 

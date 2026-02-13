@@ -113,11 +113,10 @@ func createIntegrationTestConfig(sourceHost string, sourcePort int, targetHost s
 			ReplicaIdentity:   "DEFAULT",
 		},
 		BatchConfig: config.BatchConfig{
-			BulkSize:     10,
-			Timeout:      1 * time.Second,
-			MaxRetries:   3,
-			RetryDelay:   100 * time.Millisecond,
-			RetryEnabled: true,
+			BulkSize:   10,
+			Timeout:    1 * time.Second,
+			MaxRetries: 3,
+			RetryDelay: 100 * time.Millisecond,
 		},
 		Postgres: config.PostgresConfig{
 			Source: config.DatabaseConfig{
@@ -385,12 +384,10 @@ func TestIntegrationRetryWorks(t *testing.T) {
 	err = createTestTable(ctx, targetConnStr)
 	require.NoError(t, err)
 
-	// Step 2: Configure - Enable retry mechanism with specific settings
-	// RetryEnabled=true: Activates retry logic in sink
+	// Step 2: Configure - Configure retry mechanism with specific settings
 	// MaxRetries=5: Will attempt up to 5 times before giving up
 	// RetryDelay=500ms: Base delay between retries (uses exponential backoff: delay * attempt)
 	cfg := createIntegrationTestConfig(sourceHost, sourcePort, targetHost, targetPort)
-	cfg.BatchConfig.RetryEnabled = true
 	cfg.BatchConfig.MaxRetries = 5
 	cfg.BatchConfig.RetryDelay = 500 * time.Millisecond
 	cfg.BatchConfig.Timeout = 1 * time.Second

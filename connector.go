@@ -60,11 +60,10 @@ func NewConnector(ctx context.Context, cfg *config.Connector, options ...Option)
 
 	// Create sink
 	batchConfig := config.BatchConfig{
-		BulkSize:     cfg.BatchConfig.BulkSize,
-		Timeout:      cfg.BatchConfig.Timeout,
-		MaxRetries:   cfg.BatchConfig.MaxRetries,
-		RetryDelay:   cfg.BatchConfig.RetryDelay,
-		RetryEnabled: cfg.BatchConfig.RetryEnabled,
+		BulkSize:   cfg.BatchConfig.BulkSize,
+		Timeout:    cfg.BatchConfig.Timeout,
+		MaxRetries: cfg.BatchConfig.MaxRetries,
+		RetryDelay: cfg.BatchConfig.RetryDelay,
 	}
 	pqConnector.sink = NewSink(
 		pool,
