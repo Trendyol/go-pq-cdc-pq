@@ -1,3 +1,5 @@
+
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Trendyol/go-pq-cdc-pq/badge)](https://scorecard.dev/viewer/?uri=github.com/Trendyol/go-pq-cdc-pq)
 # go-pq-cdc-pq
 
 PostgreSQL Change Data Capture (CDC) library for Go.
