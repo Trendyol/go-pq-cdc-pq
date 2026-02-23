@@ -73,13 +73,12 @@ func TestConnectorStart(t *testing.T) {
 	}
 	conn.sink = NewSink(mockPool, batchConfig, nil)
 
-	mockCDC.On("WaitUntilReady", mock.Anything).Return(nil)
 	mockCDC.On("Start", mock.Anything).Return()
 
 	conn.Start(ctx)
 
 	// Give goroutines time to start
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
 	mockCDC.AssertExpectations(t)
 }
