@@ -191,6 +191,7 @@ func TestConnectorProcessMessageInsert(t *testing.T) {
 		messages:      messages,
 		primaryKey:    "id",
 		defaultSchema: "public",
+		mapper:        DefaultMapper,
 	}
 
 	ack := func() error {
@@ -238,6 +239,7 @@ func TestConnectorProcessMessageUpdate(t *testing.T) {
 		messages:      messages,
 		primaryKey:    "id",
 		defaultSchema: "public",
+		mapper:        DefaultMapper,
 	}
 
 	ack := func() error {
@@ -288,6 +290,7 @@ func TestConnectorProcessMessageDelete(t *testing.T) {
 		messages:      messages,
 		primaryKey:    "id",
 		defaultSchema: "public",
+		mapper:        DefaultMapper,
 	}
 
 	ack := func() error {
@@ -334,6 +337,7 @@ func TestConnectorProcessSnapshotDataMessage(t *testing.T) {
 		messages:      messages,
 		primaryKey:    "id",
 		defaultSchema: "public",
+		mapper:        DefaultMapper,
 	}
 
 	ackCalled := false
@@ -499,6 +503,7 @@ func TestConnectorSendMessage(t *testing.T) {
 	conn := &connector{
 		cfg:      cfg,
 		messages: messages,
+		mapper:   DefaultMapper,
 	}
 
 	msg := Message{
@@ -531,6 +536,7 @@ func TestConnectorProcessInsertMessage(t *testing.T) {
 		messages:      messages,
 		primaryKey:    "id",
 		defaultSchema: "public",
+		mapper:        DefaultMapper,
 	}
 
 	ack := func() error { return nil }
@@ -571,6 +577,7 @@ func TestConnectorProcessDeleteMessage(t *testing.T) {
 		messages:      messages,
 		primaryKey:    "id",
 		defaultSchema: "public",
+		mapper:        DefaultMapper,
 	}
 
 	ack := func() error { return nil }
@@ -611,6 +618,7 @@ func TestConnectorProcessUpdateMessage(t *testing.T) {
 		messages:      messages,
 		primaryKey:    "id",
 		defaultSchema: "public",
+		mapper:        DefaultMapper,
 	}
 
 	ack := func() error { return nil }
@@ -692,6 +700,7 @@ func TestConnectorProcessMessageWithCustomPrimaryKey(t *testing.T) {
 		messages:      messages,
 		primaryKey:    "custom_pk",
 		defaultSchema: "public",
+		mapper:        DefaultMapper,
 	}
 
 	ack := func() error { return nil }
@@ -732,6 +741,7 @@ func TestConnectorProcessMessageWithCustomSchema(t *testing.T) {
 		messages:      messages,
 		primaryKey:    "id",
 		defaultSchema: "custom_schema",
+		mapper:        DefaultMapper,
 	}
 
 	ack := func() error { return nil }
@@ -758,4 +768,255 @@ func TestConnectorProcessMessageWithCustomSchema(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal(msgNotReceived)
 	}
+}
+
+func TestConnectorWithCustomMapper(t *testing.T) {
+	ctx := context.Background()
+	cfg := createTestConfig()
+	messages := make(chan Message, 10)
+
+	// Custom mapper that transforms table name and adds prefix to query
+	customMapper := func(event *Message) []QueryAction {
+		if event.Query == "" {
+			return nil
+		}
+		return []QueryAction{{
+			Query: "/* custom */ " + event.Query,
+			Args:  event.Args,
+		}}
+	}
+
+	conn := &connector{
+		cfg:           cfg,
+		messages:      messages,
+		primaryKey:    "id",
+		defaultSchema: "public",
+		mapper:        customMapper,
+	}
+
+	ack := func() error { return nil }
+
+	insertMsg := &format.Insert{
+		TableName:      "users",
+		TableNamespace: "public",
+		Decoded: map[string]any{
+			"id":   1,
+			"name": "test",
+		},
+	}
+
+	replCtx := &replication.ListenerContext{
+		Message: insertMsg,
+		Ack:     ack,
+	}
+
+	conn.processMessage(ctx, replCtx)
+
+	select {
+	case msg := <-messages:
+		assert.Contains(t, msg.Query, "/* custom */")
+		assert.Contains(t, msg.Query, "INSERT INTO")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal(msgNotReceived)
+	}
+}
+
+func TestConnectorWithCustomMapperMultipleActions(t *testing.T) {
+	ctx := context.Background()
+	cfg := createTestConfig()
+	messages := make(chan Message, 10)
+
+	// Custom mapper that generates multiple queries from a single event
+	customMapper := func(event *Message) []QueryAction {
+		if event.Query == "" {
+			return nil
+		}
+		return []QueryAction{
+			{Query: "INSERT INTO audit_log (action) VALUES ($1)", Args: []any{event.Action}},
+			{Query: event.Query, Args: event.Args},
+		}
+	}
+
+	conn := &connector{
+		cfg:           cfg,
+		messages:      messages,
+		primaryKey:    "id",
+		defaultSchema: "public",
+		mapper:        customMapper,
+	}
+
+	ackCalled := false
+	ack := func() error {
+		ackCalled = true
+		return nil
+	}
+
+	insertMsg := &format.Insert{
+		TableName:      "users",
+		TableNamespace: "public",
+		Decoded: map[string]any{
+			"id":   1,
+			"name": "test",
+		},
+	}
+
+	replCtx := &replication.ListenerContext{
+		Message: insertMsg,
+		Ack:     ack,
+	}
+
+	conn.processMessage(ctx, replCtx)
+
+	// First message: audit log (no ack)
+	select {
+	case msg := <-messages:
+		assert.Contains(t, msg.Query, "audit_log")
+		assert.Nil(t, msg.Ack, "first action should not have ack")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal(msgNotReceived)
+	}
+
+	// Second message: original insert (with ack)
+	select {
+	case msg := <-messages:
+		assert.Contains(t, msg.Query, "INSERT INTO")
+		assert.NotNil(t, msg.Ack, "last action should have ack")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal(msgNotReceived)
+	}
+
+	assert.False(t, ackCalled, "ack should not be called until sink processes")
+}
+
+func TestConnectorWithCustomMapperFilterEvent(t *testing.T) {
+	ctx := context.Background()
+	cfg := createTestConfig()
+	messages := make(chan Message, 10)
+
+	// Custom mapper that filters out certain events
+	customMapper := func(event *Message) []QueryAction {
+		// Filter out events for "ignored_table"
+		if event.Table == "ignored_table" {
+			return nil
+		}
+		return []QueryAction{{
+			Query: event.Query,
+			Args:  event.Args,
+		}}
+	}
+
+	conn := &connector{
+		cfg:           cfg,
+		messages:      messages,
+		primaryKey:    "id",
+		defaultSchema: "public",
+		mapper:        customMapper,
+	}
+
+	ackCalled := false
+	ack := func() error {
+		ackCalled = true
+		return nil
+	}
+
+	insertMsg := &format.Insert{
+		TableName:      "ignored_table",
+		TableNamespace: "public",
+		Decoded: map[string]any{
+			"id":   1,
+			"name": "test",
+		},
+	}
+
+	replCtx := &replication.ListenerContext{
+		Message: insertMsg,
+		Ack:     ack,
+	}
+
+	conn.processMessage(ctx, replCtx)
+
+	// No message should be sent, but ack should be called
+	select {
+	case <-messages:
+		t.Fatal("message should not be sent for filtered event")
+	case <-time.After(50 * time.Millisecond):
+		// Expected: no message
+	}
+
+	assert.True(t, ackCalled, "ack should be called for filtered events")
+}
+
+func TestConnectorWithCustomMapperTransformData(t *testing.T) {
+	ctx := context.Background()
+	cfg := createTestConfig()
+	messages := make(chan Message, 10)
+
+	// Custom mapper that transforms data to write to a different table
+	customMapper := func(event *Message) []QueryAction {
+		if event.Action != "INSERT" {
+			return nil
+		}
+		// Transform: write to archive table instead
+		return []QueryAction{{
+			Query: "INSERT INTO users_archive (id, name, archived_at) VALUES ($1, $2, NOW())",
+			Args:  []any{event.NewValues["id"], event.NewValues["name"]},
+		}}
+	}
+
+	conn := &connector{
+		cfg:           cfg,
+		messages:      messages,
+		primaryKey:    "id",
+		defaultSchema: "public",
+		mapper:        customMapper,
+	}
+
+	ack := func() error { return nil }
+
+	insertMsg := &format.Insert{
+		TableName:      "users",
+		TableNamespace: "public",
+		Decoded: map[string]any{
+			"id":   1,
+			"name": "test",
+		},
+	}
+
+	replCtx := &replication.ListenerContext{
+		Message: insertMsg,
+		Ack:     ack,
+	}
+
+	conn.processMessage(ctx, replCtx)
+
+	select {
+	case msg := <-messages:
+		assert.Contains(t, msg.Query, "users_archive")
+		assert.Contains(t, msg.Query, "archived_at")
+		assert.Equal(t, []any{1, "test"}, msg.Args)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal(msgNotReceived)
+	}
+}
+
+func TestDefaultMapperReturnsNilForEmptyQuery(t *testing.T) {
+	event := &Message{
+		Query: "",
+		Args:  nil,
+	}
+
+	actions := DefaultMapper(event)
+	assert.Nil(t, actions)
+}
+
+func TestDefaultMapperReturnsQueryAction(t *testing.T) {
+	event := &Message{
+		Query: "INSERT INTO users VALUES ($1)",
+		Args:  []any{1},
+	}
+
+	actions := DefaultMapper(event)
+	assert.Len(t, actions, 1)
+	assert.Equal(t, event.Query, actions[0].Query)
+	assert.Equal(t, event.Args, actions[0].Args)
 }

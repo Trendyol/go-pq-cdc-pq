@@ -1,0 +1,56 @@
+app:
+  name: custom-mapping-example
+
+server:
+  port: 8080
+
+connector:
+  publication: simple_publication
+  table: users
+  schema: public
+  slot: simple_slot
+  slot_activity_checker_interval: 3000ms
+  create_if_not_exists: true
+  bulk_size: 1000
+  timeout: 30s
+  max_retries: 3
+  retry_delay: 1s
+  log_level: 1
+  debug_mode: true
+  create_target_table_if_not_exists: true
+  replica_identity: DEFAULT  # DEFAULT or FULL
+
+tablePrimaryKeys:
+  crash_test: id
+  crash_test2: id
+  mock_data_table: id_pk
+
+postgres:
+  source:
+    host: 127.0.0.1
+    port: 5432
+    user: source_user
+    password: source_pass
+    db: cdc_db
+  target:
+    host: 127.0.0.1
+    port: 5433  # docker-compose exposes target on 5433
+    user: target_user
+    password: target_pass
+    db: cdc_db
+
+batch:
+  bulk_size: 1000
+  timeout: 1s
+  max_retries: 3
+  retry_delay: 1s
+
+cdc:
+  metric:
+    port: 8080
+  snapshot:
+    enabled: true
+    mode: initial
+    chunkSize: 1000
+    claimTimeout: 30s
+    heartbeatInterval: 10s

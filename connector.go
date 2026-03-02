@@ -31,6 +31,7 @@ type connector struct {
 	pool          database.Pool
 	primaryKey    string
 	defaultSchema string
+	mapper        Mapper
 }
 
 func NewConnector(ctx context.Context, cfg *config.Connector, options ...Option) (Connector, error) {
@@ -46,6 +47,7 @@ func NewConnector(ctx context.Context, cfg *config.Connector, options ...Option)
 		cfg:           cfg,
 		primaryKey:    opts.PrimaryKey,
 		defaultSchema: opts.DefaultSchema,
+		mapper:        opts.Mapper,
 	}
 
 	// Initialize database pool for target database
@@ -278,7 +280,36 @@ func (c *connector) processUpdateMessage(ctx context.Context, msg *format.Update
 }
 
 func (c *connector) sendMessage(message Message) {
-	c.messages <- message
+	actions := c.mapper(&message)
+	if len(actions) == 0 {
+		if message.Ack != nil {
+			message.Ack()
+		}
+		return
+	}
+
+	for i, action := range actions {
+		msg := Message{
+			Query:          action.Query,
+			Args:           action.Args,
+			EventTime:      message.EventTime,
+			TableName:      message.TableName,
+			TableNamespace: message.TableNamespace,
+			Type:           message.Type,
+			Schema:         message.Schema,
+			Table:          message.Table,
+			Action:         message.Action,
+			OldKeys:        message.OldKeys,
+			NewValues:      message.NewValues,
+			OldData:        message.OldData,
+			NewData:        message.NewData,
+		}
+		// Only set Ack on the last action to ensure all queries complete before ack
+		if i == len(actions)-1 {
+			msg.Ack = message.Ack
+		}
+		c.messages <- msg
+	}
 }
 
 func (c *connector) resolvePrimaryKey(tableName string) string {
