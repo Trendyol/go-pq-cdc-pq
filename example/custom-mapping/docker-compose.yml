@@ -1,0 +1,55 @@
+services:
+  postgres-source:
+    image: postgres:16.2
+    container_name: postgres-source
+    restart: always
+    command: ["-c", "wal_level=logical", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10"]
+    environment:
+      POSTGRES_USER: "source_user"
+      POSTGRES_PASSWORD: "source_pass"
+      POSTGRES_DB: "cdc_db"
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - postgres_source_dat:/var/lib/postgresql/data
+      - ./init_source.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - cdc_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U source_user -d cdc_db -h postgres-source"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-target:
+    image: postgres:16.2
+    container_name: postgres-target
+    restart: always
+    command: ["-c", "wal_level=logical", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10"]
+    environment:
+      POSTGRES_USER: "target_user"
+      POSTGRES_PASSWORD: "target_pass"
+      POSTGRES_DB: "cdc_db"
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - postgres_target_dat:/var/lib/postgresql/data
+      - ./init_target.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5433:5432"
+    networks:
+      - cdc_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U target_user -d cdc_db -h postgres-target"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_source_dat:
+  postgres_target_dat:
+
+networks:
+  cdc_net:
+    driver: bridge
+

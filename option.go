@@ -13,6 +13,7 @@ type Config struct {
 	PrimaryKey        string
 	DefaultSchema     string
 	TablePrimaryKeys  map[string]string
+	Mapper            Mapper
 }
 
 // Option represents an option for customizing the connector config.
@@ -24,6 +25,7 @@ func defaultConfig() Config {
 		PrimaryKey:       "id",
 		DefaultSchema:    "public",
 		TablePrimaryKeys: make(map[string]string),
+		Mapper:           DefaultMapper,
 	}
 }
 
@@ -65,5 +67,17 @@ func WithTablePrimaryKeys(primaryKeys map[string]string) Option {
 func WithDefaultSchema(schema string) Option {
 	return func(cfg *Config) {
 		cfg.DefaultSchema = schema
+	}
+}
+
+// WithMapper overrides the default mapper function used to transform CDC events
+// into SQL queries. This allows custom transformation logic such as:
+// - Writing to different tables
+// - Transforming field names or values
+// - Filtering events
+// - Writing to multiple tables from a single event
+func WithMapper(mapper Mapper) Option {
+	return func(cfg *Config) {
+		cfg.Mapper = mapper
 	}
 }
