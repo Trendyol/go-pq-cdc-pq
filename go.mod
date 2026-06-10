@@ -1,10 +1,10 @@
 module github.com/Trendyol/go-pq-cdc-pq
 
-go 1.24.0
+go 1.25.0
 
 require (
-	github.com/Trendyol/go-pq-cdc v1.9.10
-	github.com/jackc/pgx/v5 v5.7.6
+	github.com/Trendyol/go-pq-cdc v1.10.11
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.40.0
