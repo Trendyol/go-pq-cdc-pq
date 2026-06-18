@@ -8,6 +8,7 @@ import (
 
 type Message struct {
 	EventTime      time.Time
+	LSN            string // WAL LSN in Postgres "X/Y" format; "" if unavailable
 	TableName      string
 	TableNamespace string
 
@@ -30,6 +31,7 @@ type Message struct {
 func NewInsertMessage(m *format.Insert) *Message {
 	return &Message{
 		EventTime:      m.MessageTime,
+		LSN:            m.LSN.String(),
 		TableName:      m.TableName,
 		TableNamespace: m.TableNamespace,
 		OldData:        nil,
@@ -41,6 +43,7 @@ func NewInsertMessage(m *format.Insert) *Message {
 func NewUpdateMessage(m *format.Update) *Message {
 	return &Message{
 		EventTime:      m.MessageTime,
+		LSN:            m.LSN.String(),
 		TableName:      m.TableName,
 		TableNamespace: m.TableNamespace,
 		OldData:        m.OldDecoded,
@@ -52,6 +55,7 @@ func NewUpdateMessage(m *format.Update) *Message {
 func NewDeleteMessage(m *format.Delete) *Message {
 	return &Message{
 		EventTime:      m.MessageTime,
+		LSN:            m.LSN.String(),
 		TableName:      m.TableName,
 		TableNamespace: m.TableNamespace,
 		OldData:        m.OldDecoded,
@@ -63,6 +67,7 @@ func NewDeleteMessage(m *format.Delete) *Message {
 func NewSnapshotMessage(m *format.Snapshot) *Message {
 	return &Message{
 		EventTime:      m.ServerTime,
+		LSN:            m.LSN.String(),
 		TableName:      m.Table,
 		TableNamespace: m.Schema,
 		OldData:        nil,
