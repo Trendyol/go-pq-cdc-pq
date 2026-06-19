@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/stretchr/testify/assert"
 )
@@ -318,6 +319,16 @@ func TestNewUpdateMessageWithNilNewDecoded(t *testing.T) {
 	assert.NotNil(t, msg.OldData)
 	assert.Nil(t, msg.NewData)
 	assert.Equal(t, UpdateMessage, msg.Type)
+}
+
+func TestNewMessageCopiesLSN(t *testing.T) {
+	const lsn = pq.LSN(26647832)
+	want := lsn.String()
+
+	assert.Equal(t, want, NewInsertMessage(&format.Insert{LSN: lsn}).LSN)
+	assert.Equal(t, want, NewUpdateMessage(&format.Update{LSN: lsn}).LSN)
+	assert.Equal(t, want, NewDeleteMessage(&format.Delete{LSN: lsn}).LSN)
+	assert.Equal(t, want, NewSnapshotMessage(&format.Snapshot{LSN: lsn}).LSN)
 }
 
 func TestNewDeleteMessageWithNilOldDecoded(t *testing.T) {
