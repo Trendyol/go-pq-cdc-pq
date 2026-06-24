@@ -8,6 +8,8 @@ github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERo
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/Trendyol/go-pq-cdc v1.10.11 h1:z8qr92Kysy2C55Uita8hhL3MVCXEhE8/YwZ+VZQwp/E=
 github.com/Trendyol/go-pq-cdc v1.10.11/go.mod h1:a0Z9SANfTzs/5tQyBq2cUCkzyW2rgDrdpQuegKKSx34=
+github.com/Trendyol/go-pq-cdc v1.10.12-0.20260624152255-80314681827e h1:7YGITm9+uqh845QDwzf1FnJisoBsf/mUNNKZWMB7XO4=
+github.com/Trendyol/go-pq-cdc v1.10.12-0.20260624152255-80314681827e/go.mod h1:a0Z9SANfTzs/5tQyBq2cUCkzyW2rgDrdpQuegKKSx34=
 github.com/avast/retry-go/v4 v4.7.0 h1:yjDs35SlGvKwRNSykujfjdMxMhMQQM0TnIjJaHB+Zio=
 github.com/avast/retry-go/v4 v4.7.0/go.mod h1:ZMPDa3sY2bKgpLtap9JRUgk2yTAba7cgiFhqxY2Sg6Q=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
