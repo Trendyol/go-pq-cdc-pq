@@ -331,6 +331,13 @@ func TestNewMessageCopiesLSN(t *testing.T) {
 	assert.Equal(t, want, NewSnapshotMessage(&format.Snapshot{LSN: lsn}).LSN)
 }
 
+func TestNewMessageDefaultsTransactionIDToZero(t *testing.T) {
+	assert.Zero(t, NewInsertMessage(&format.Insert{}).TransactionID)
+	assert.Zero(t, NewUpdateMessage(&format.Update{}).TransactionID)
+	assert.Zero(t, NewDeleteMessage(&format.Delete{}).TransactionID)
+	assert.Zero(t, NewSnapshotMessage(&format.Snapshot{}).TransactionID)
+}
+
 func TestNewDeleteMessageWithNilOldDecoded(t *testing.T) {
 	now := time.Now()
 	deleteMsg := &format.Delete{

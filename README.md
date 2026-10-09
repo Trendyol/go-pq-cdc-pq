@@ -33,6 +33,12 @@ gopqcdcpq.WithTablePrimaryKeys(map[string]string{
 })
 ```
 
+## Change Metadata
+
+`Message.LSN` is the WAL position of the change in PostgreSQL `X/Y` form. It increases with every change to a given row, so a sink that stores it per row can skip a change older than the one it already has. Snapshot events carry the LSN the snapshot was taken at, shared by every snapshot row.
+
+`Message.TransactionID` is the top-level transaction that produced the change, and `0` for snapshot events. Use it to group related changes from one transaction; compare `LSN` to order changes to the same row across transactions. `TransactionID` is 32-bit and wraps around, so use it to group changes, not to order them.
+
 ## License
 
 MIT

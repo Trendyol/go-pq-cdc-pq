@@ -356,7 +356,7 @@ func TestConnectorProcessSnapshotDataMessage(t *testing.T) {
 		},
 	}
 
-	conn.processSnapshotMessage(ctx, snapshotMsg, ack)
+	conn.processSnapshotMessage(ctx, snapshotMsg, ack, 0)
 
 	select {
 	case msg := <-messages:
@@ -392,7 +392,7 @@ func TestConnectorProcessSnapshotBeginAck(t *testing.T) {
 		EventType: format.SnapshotEventTypeBegin,
 	}
 
-	conn.processSnapshotMessage(ctx, snapshotMsg, ack)
+	conn.processSnapshotMessage(ctx, snapshotMsg, ack, 0)
 
 	assert.True(t, ackCalled, "snapshot begin should be acked immediately")
 }
@@ -415,7 +415,7 @@ func TestConnectorProcessSnapshotEndAck(t *testing.T) {
 		EventType: format.SnapshotEventTypeEnd,
 	}
 
-	conn.processSnapshotMessage(ctx, snapshotMsg, ack)
+	conn.processSnapshotMessage(ctx, snapshotMsg, ack, 0)
 
 	assert.True(t, ackCalled, "snapshot end should be acked immediately")
 }
@@ -550,7 +550,7 @@ func TestConnectorProcessInsertMessage(t *testing.T) {
 		},
 	}
 
-	conn.processInsertMessage(ctx, insertMsg, ack)
+	conn.processInsertMessage(ctx, insertMsg, ack, 0)
 
 	select {
 	case msg := <-messages:
@@ -562,6 +562,71 @@ func TestConnectorProcessInsertMessage(t *testing.T) {
 		assert.NotNil(t, msg.NewValues)
 		assert.Nil(t, msg.OldKeys)
 		assert.NotNil(t, msg.Ack)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal(msgNotReceived)
+	}
+}
+
+func TestConnectorProcessMessageCarriesTransactionID(t *testing.T) {
+	ctx := context.Background()
+	cfg := createTestConfig()
+	messages := make(chan Message, 10)
+
+	conn := &connector{
+		cfg:           cfg,
+		messages:      messages,
+		primaryKey:    "id",
+		defaultSchema: "public",
+		mapper:        DefaultMapper,
+	}
+
+	const xid uint32 = 4711
+	replCtx := &replication.ListenerContext{
+		Message: &format.Insert{
+			TableName:      "users",
+			TableNamespace: "public",
+			Decoded:        map[string]any{"id": 1, "name": "test"},
+		},
+		Ack: func() error { return nil },
+		Xid: xid,
+	}
+
+	conn.processMessage(ctx, replCtx)
+
+	select {
+	case msg := <-messages:
+		assert.Equal(t, xid, msg.TransactionID)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal(msgNotReceived)
+	}
+}
+
+func TestConnectorSendMessagePreservesTransactionID(t *testing.T) {
+	cfg := createTestConfig()
+	messages := make(chan Message, 10)
+
+	conn := &connector{
+		cfg:      cfg,
+		messages: messages,
+		mapper:   DefaultMapper,
+	}
+
+	const xid uint32 = 4711
+	msg := Message{
+		Table:         "users",
+		Action:        "INSERT",
+		Query:         "INSERT INTO users VALUES ($1)",
+		Args:          []any{1},
+		LSN:           "0/1",
+		TransactionID: xid,
+	}
+
+	conn.sendMessage(msg)
+
+	select {
+	case received := <-messages:
+		assert.Equal(t, xid, received.TransactionID)
+		assert.Equal(t, "0/1", received.LSN)
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal(msgNotReceived)
 	}
@@ -591,7 +656,7 @@ func TestConnectorProcessDeleteMessage(t *testing.T) {
 		},
 	}
 
-	conn.processDeleteMessage(ctx, deleteMsg, ack)
+	conn.processDeleteMessage(ctx, deleteMsg, ack, 0)
 
 	select {
 	case msg := <-messages:
@@ -636,7 +701,7 @@ func TestConnectorProcessUpdateMessage(t *testing.T) {
 		},
 	}
 
-	conn.processUpdateMessage(ctx, updateMsg, ack)
+	conn.processUpdateMessage(ctx, updateMsg, ack, 0)
 
 	select {
 	case msg := <-messages:

@@ -149,16 +149,16 @@ func (c *connector) processMessage(ctx context.Context, replCtx *replication.Lis
 
 	switch msg := replCtx.Message.(type) {
 	case *format.Insert:
-		c.processInsertMessage(ctx, msg, replCtx.Ack)
+		c.processInsertMessage(ctx, msg, replCtx.Ack, replCtx.Xid)
 
 	case *format.Delete:
-		c.processDeleteMessage(ctx, msg, replCtx.Ack)
+		c.processDeleteMessage(ctx, msg, replCtx.Ack, replCtx.Xid)
 
 	case *format.Update:
-		c.processUpdateMessage(ctx, msg, replCtx.Ack)
+		c.processUpdateMessage(ctx, msg, replCtx.Ack, replCtx.Xid)
 
 	case *format.Snapshot:
-		c.processSnapshotMessage(ctx, msg, replCtx.Ack)
+		c.processSnapshotMessage(ctx, msg, replCtx.Ack, replCtx.Xid)
 
 	case *format.Relation:
 		log.Debug("Relation message received",
@@ -176,7 +176,7 @@ func (c *connector) processMessage(ctx context.Context, replCtx *replication.Lis
 	}
 }
 
-func (c *connector) processInsertMessage(ctx context.Context, msg *format.Insert, ack func() error) {
+func (c *connector) processInsertMessage(ctx context.Context, msg *format.Insert, ack func() error, xid uint32) {
 
 	msgObj := NewInsertMessage(msg)
 	// Set internal fields for target database query processing
@@ -190,12 +190,13 @@ func (c *connector) processInsertMessage(ctx context.Context, msg *format.Insert
 	msgObj.Action = "INSERT"
 	msgObj.OldKeys = nil
 	msgObj.NewValues = msg.Decoded
+	msgObj.TransactionID = xid
 
 	c.sendMessage(*msgObj)
 
 }
 
-func (c *connector) processDeleteMessage(ctx context.Context, msg *format.Delete, ack func() error) {
+func (c *connector) processDeleteMessage(ctx context.Context, msg *format.Delete, ack func() error, xid uint32) {
 	msgObj := NewDeleteMessage(msg)
 	// Set internal fields for target database query processing
 	primaryKey := c.resolvePrimaryKey(msg.TableName)
@@ -208,12 +209,13 @@ func (c *connector) processDeleteMessage(ctx context.Context, msg *format.Delete
 	msgObj.Action = "DELETE"
 	msgObj.OldKeys = msg.OldDecoded
 	msgObj.NewValues = nil
+	msgObj.TransactionID = xid
 
 	c.sendMessage(*msgObj)
 
 }
 
-func (c *connector) processSnapshotMessage(ctx context.Context, msg *format.Snapshot, ack func() error) {
+func (c *connector) processSnapshotMessage(ctx context.Context, msg *format.Snapshot, ack func() error, xid uint32) {
 	log := slogctx.FromCtx(ctx)
 
 	switch msg.EventType {
@@ -247,6 +249,7 @@ func (c *connector) processSnapshotMessage(ctx context.Context, msg *format.Snap
 		msgObj.Action = "SNAPSHOT"
 		msgObj.OldKeys = nil
 		msgObj.NewValues = msg.Data
+		msgObj.TransactionID = xid
 		c.sendMessage(*msgObj)
 		return
 
@@ -260,7 +263,7 @@ func (c *connector) processSnapshotMessage(ctx context.Context, msg *format.Snap
 	}
 }
 
-func (c *connector) processUpdateMessage(ctx context.Context, msg *format.Update, ack func() error) {
+func (c *connector) processUpdateMessage(ctx context.Context, msg *format.Update, ack func() error, xid uint32) {
 
 	msgObj := NewUpdateMessage(msg)
 	// Set internal fields for target database query processing
@@ -274,6 +277,7 @@ func (c *connector) processUpdateMessage(ctx context.Context, msg *format.Update
 	msgObj.Action = "UPDATE"
 	msgObj.OldKeys = msg.OldDecoded
 	msgObj.NewValues = msg.NewDecoded
+	msgObj.TransactionID = xid
 
 	c.sendMessage(*msgObj)
 
@@ -293,9 +297,11 @@ func (c *connector) sendMessage(message Message) {
 			Query:          action.Query,
 			Args:           action.Args,
 			EventTime:      message.EventTime,
+			LSN:            message.LSN,
 			TableName:      message.TableName,
 			TableNamespace: message.TableNamespace,
 			Type:           message.Type,
+			TransactionID:  message.TransactionID,
 			Schema:         message.Schema,
 			Table:          message.Table,
 			Action:         message.Action,

@@ -17,6 +17,10 @@ type Message struct {
 
 	Type MessageType
 
+	// TransactionID is the top-level PostgreSQL transaction that produced the change,
+	// zero for snapshot events. It is 32-bit and wraps around: it groups changes, LSN orders them.
+	TransactionID uint32
+
 	// Internal fields for batch processing
 	Query     string
 	Args      []any
