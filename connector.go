@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
-	"os/signal"
-	"syscall"
+	"sync"
 
 	cdc "github.com/Trendyol/go-pq-cdc"
 	"github.com/Trendyol/go-pq-cdc-pq/config"
@@ -32,15 +30,44 @@ type connector struct {
 	primaryKey    string
 	defaultSchema string
 	mapper        Mapper
+
+	lifecycleMu   sync.RWMutex
+	lifecycleOnce sync.Once
+	closeOnce     sync.Once
+	runCtx        context.Context
+	cancel        context.CancelFunc
+	fatalErr      error
+	stopped       chan struct{}
+	sinkStopped   chan struct{}
+	cdcStopped    chan struct{}
+	cdcReady      chan struct{}
+	cdcReadyOnce  sync.Once
+	cdcReadyErr   error
+	cdcStartDone  chan struct{}
+	started       bool
+	closing       bool
+
+	// sendMu preserves event order across concurrent source/snapshot callbacks.
+	sendMu sync.Mutex
 }
 
 func NewConnector(ctx context.Context, cfg *config.Connector, options ...Option) (Connector, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("connector configuration is required")
+	}
 	cfg.SetDefault()
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid connector configuration: %w", err)
+	}
 
-	// Apply options
 	opts := defaultConfig()
 	for _, option := range options {
-		option(&opts)
+		if option != nil {
+			option(&opts)
+		}
+	}
+	if opts.Mapper == nil {
+		return nil, fmt.Errorf("mapper must not be nil")
 	}
 
 	pqConnector := &connector{
@@ -48,36 +75,20 @@ func NewConnector(ctx context.Context, cfg *config.Connector, options ...Option)
 		primaryKey:    opts.PrimaryKey,
 		defaultSchema: opts.DefaultSchema,
 		mapper:        opts.Mapper,
+		messages:      make(chan Message, cfg.ConnectorConfig.BulkSize),
 	}
+	pqConnector.initLifecycle()
 
-	// Initialize database pool for target database
 	pool, err := database.NewTargetPool(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create database pool: %w", err)
+		return nil, fmt.Errorf("failed to create target database pool: %w", err)
 	}
 	pqConnector.pool = pool
+	pqConnector.sink = NewSink(pool, cfg.BatchConfig, slog.Default())
 
-	// Create message channel
-	pqConnector.messages = make(chan Message, cfg.ConnectorConfig.BulkSize)
-
-	// Create sink
-	batchConfig := config.BatchConfig{
-		BulkSize:   cfg.BatchConfig.BulkSize,
-		Timeout:    cfg.BatchConfig.Timeout,
-		MaxRetries: cfg.BatchConfig.MaxRetries,
-		RetryDelay: cfg.BatchConfig.RetryDelay,
-	}
-	pqConnector.sink = NewSink(
-		pool,
-		batchConfig,
-		slog.Default().With("component", "Sink"),
-	)
-
-	// Build CDC configuration
-
-	// Create CDC connector
 	pqCDC, err := cdc.NewConnector(ctx, cfg.CDC, pqConnector.listener)
 	if err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("failed to create CDC connector: %w", err)
 	}
 	pqConnector.cdc = pqCDC
@@ -85,132 +96,83 @@ func NewConnector(ctx context.Context, cfg *config.Connector, options ...Option)
 	return pqConnector, nil
 }
 
-func (c *connector) Start(ctx context.Context) {
-	go func() {
-		log := slogctx.FromCtx(ctx)
-		log.Info("waiting for connector start...")
-
-		// Start sink
-		sinkCtx := slogctx.Append(ctx, "component", "Sink")
-		// Convert Message channel to pqconnector.Message channel
-		pqMessages := make(chan Message, cap(c.messages))
-		go func() {
-			for msg := range c.messages {
-				pqMessages <- Message{
-					Query: msg.Query,
-					Args:  msg.Args,
-					Ack:   msg.Ack,
-				}
-			}
-			close(pqMessages)
-		}()
-		go c.sink.Start(sinkCtx, pqMessages)
-	}()
-
-	c.cdc.Start(ctx)
-}
-
-func (c *connector) WaitForShutdown(ctx context.Context) error {
-	log := slogctx.FromCtx(ctx)
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case sig := <-sigChan:
-		log.Info("shutdown signal received", "signal", sig.String())
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (c *connector) Close() {
-	c.cdc.Close()
-	close(c.messages)
-	if c.pool != nil {
-		c.pool.Close()
-	}
-}
-
-func (c *connector) listener(ctx *replication.ListenerContext) {
-	// Handle keepalive messages
-	if ctx.Message == nil {
+func (c *connector) listener(replCtx *replication.ListenerContext) {
+	if replCtx == nil || replCtx.Message == nil {
 		return
 	}
 
-	// Process the message
-	c.processMessage(context.Background(), ctx)
+	ctx := c.processingContext()
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	// Wait for the CDC connector to be ready before relaying data events. This
+	// prevents acknowledging snapshot/relation metadata ahead of target writes.
+	if c.cfg == nil || !c.cfg.CDC.IsSnapshotOnlyMode() {
+		if err := c.waitUntilReady(ctx); err != nil {
+			return
+		}
+	}
+	c.processMessage(ctx, replCtx)
+
+	// Snapshot data callbacks do not wait on Ack. Insert a sink barrier so
+	// snapshot completion metadata cannot mark unapplied rows complete.
+	if snapshot, ok := replCtx.Message.(*format.Snapshot); ok && snapshot.EventType == format.SnapshotEventTypeData {
+		done := make(chan struct{})
+		c.sendAcknowledgement(func() error {
+			close(done)
+			return nil
+		})
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+	}
 }
 
 func (c *connector) processMessage(ctx context.Context, replCtx *replication.ListenerContext) {
 	log := slogctx.FromCtx(ctx)
-
-	log.Debug("Processing replication message", "messageType", fmt.Sprintf("%T", replCtx.Message))
+	log.Debug("processing replication message", "messageType", fmt.Sprintf("%T", replCtx.Message))
 
 	switch msg := replCtx.Message.(type) {
 	case *format.Insert:
 		c.processInsertMessage(ctx, msg, replCtx.Ack)
-
 	case *format.Delete:
 		c.processDeleteMessage(ctx, msg, replCtx.Ack)
-
 	case *format.Update:
 		c.processUpdateMessage(ctx, msg, replCtx.Ack)
-
 	case *format.Snapshot:
 		c.processSnapshotMessage(ctx, msg, replCtx.Ack)
-
 	case *format.Relation:
-		log.Debug("Relation message received",
-			"namespace", msg.Namespace,
-			"table", msg.Name,
-			"columns", len(msg.Columns))
-		if replCtx.Ack != nil {
-			replCtx.Ack()
-		}
-
+		// Control metadata is acknowledged only behind earlier target writes.
+		log.Debug("relation message received", "namespace", msg.Namespace, "table", msg.Name, "columns", len(msg.Columns))
+		c.sendAcknowledgement(replCtx.Ack)
 	default:
-		log.Warn("Unknown message type received",
-			"type", fmt.Sprintf("%T", msg),
-			"message", msg)
+		c.fail(fmt.Errorf("unsupported replication message %T; refusing to acknowledge past it", msg))
 	}
 }
 
-func (c *connector) processInsertMessage(ctx context.Context, msg *format.Insert, ack func() error) {
-
+func (c *connector) processInsertMessage(_ context.Context, msg *format.Insert, ack func() error) {
 	msgObj := NewInsertMessage(msg)
-	// Set internal fields for target database query processing
 	primaryKey := c.resolvePrimaryKey(msg.TableName)
-	querySQL, args := sqlutil.BuildUpsertQuery(msg.TableName, msg.Decoded, primaryKey)
-	msgObj.Query = querySQL
-	msgObj.Args = args
+	msgObj.Query, msgObj.Args = sqlutil.BuildUpsertQuery(msg.TableName, msg.Decoded, primaryKey)
 	msgObj.Ack = ack
 	msgObj.Schema = c.defaultSchema
 	msgObj.Table = msg.TableName
 	msgObj.Action = "INSERT"
-	msgObj.OldKeys = nil
 	msgObj.NewValues = msg.Decoded
-
 	c.sendMessage(*msgObj)
-
 }
 
-func (c *connector) processDeleteMessage(ctx context.Context, msg *format.Delete, ack func() error) {
+func (c *connector) processDeleteMessage(_ context.Context, msg *format.Delete, ack func() error) {
 	msgObj := NewDeleteMessage(msg)
-	// Set internal fields for target database query processing
 	primaryKey := c.resolvePrimaryKey(msg.TableName)
-	querySQL, args := sqlutil.BuildDeleteQuery(msg.TableName, msg.OldDecoded, primaryKey)
-	msgObj.Query = querySQL
-	msgObj.Args = args
+	msgObj.Query, msgObj.Args = sqlutil.BuildDeleteQuery(msg.TableName, msg.OldDecoded, primaryKey)
 	msgObj.Ack = ack
 	msgObj.Schema = c.defaultSchema
 	msgObj.Table = msg.TableName
 	msgObj.Action = "DELETE"
 	msgObj.OldKeys = msg.OldDecoded
-	msgObj.NewValues = nil
-
 	c.sendMessage(*msgObj)
-
 }
 
 func (c *connector) processSnapshotMessage(ctx context.Context, msg *format.Snapshot, ack func() error) {
@@ -219,72 +181,55 @@ func (c *connector) processSnapshotMessage(ctx context.Context, msg *format.Snap
 	switch msg.EventType {
 	case format.SnapshotEventTypeBegin:
 		log.Info("snapshot started", "lsn", msg.LSN.String(), "totalRows", msg.TotalRows)
-		if ack != nil {
-			if err := ack(); err != nil {
-				log.Error("failed to ack snapshot begin", "error", err)
-			}
-		}
-		return
+		c.sendAcknowledgement(ack)
 
 	case format.SnapshotEventTypeEnd:
 		log.Info("snapshot completed", "lsn", msg.LSN.String(), "isLast", msg.IsLast)
-		if ack != nil {
-			if err := ack(); err != nil {
-				log.Error("failed to ack snapshot end", "error", err)
-			}
-		}
-		return
+		c.sendAcknowledgement(ack)
 
 	case format.SnapshotEventTypeData:
 		msgObj := NewSnapshotMessage(msg)
 		primaryKey := c.resolvePrimaryKey(msg.Table)
-		querySQL, args := sqlutil.BuildUpsertQuery(msg.Table, msg.Data, primaryKey)
-		msgObj.Query = querySQL
-		msgObj.Args = args
+		msgObj.Query, msgObj.Args = sqlutil.BuildUpsertQuery(msg.Table, msg.Data, primaryKey)
 		msgObj.Ack = ack
 		msgObj.Schema = c.defaultSchema
 		msgObj.Table = msg.Table
 		msgObj.Action = "SNAPSHOT"
-		msgObj.OldKeys = nil
 		msgObj.NewValues = msg.Data
 		c.sendMessage(*msgObj)
-		return
 
 	default:
-		log.Warn("unknown snapshot event type", "eventType", msg.EventType)
-		if ack != nil {
-			if err := ack(); err != nil {
-				log.Error("failed to ack unknown snapshot event", "error", err)
-			}
-		}
+		c.fail(fmt.Errorf("unsupported snapshot event type %v; refusing to acknowledge it", msg.EventType))
 	}
 }
 
-func (c *connector) processUpdateMessage(ctx context.Context, msg *format.Update, ack func() error) {
-
+func (c *connector) processUpdateMessage(_ context.Context, msg *format.Update, ack func() error) {
 	msgObj := NewUpdateMessage(msg)
-	// Set internal fields for target database query processing
 	primaryKey := c.resolvePrimaryKey(msg.TableName)
-	querySQL, args := sqlutil.BuildUpsertQuery(msg.TableName, msg.NewDecoded, primaryKey)
-	msgObj.Query = querySQL
-	msgObj.Args = args
+	msgObj.Query, msgObj.Args = sqlutil.BuildUpsertQuery(msg.TableName, msg.NewDecoded, primaryKey)
 	msgObj.Ack = ack
 	msgObj.Schema = c.defaultSchema
 	msgObj.Table = msg.TableName
 	msgObj.Action = "UPDATE"
 	msgObj.OldKeys = msg.OldDecoded
 	msgObj.NewValues = msg.NewDecoded
-
 	c.sendMessage(*msgObj)
-
 }
 
+// sendMessage applies the mapper and queues the resulting actions in order,
+// attaching the acknowledgement to the final action. An empty action set
+// becomes an ordered barrier so the event cannot acknowledge past pending writes.
 func (c *connector) sendMessage(message Message) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	ctx := c.processingContext()
+	if ctx.Err() != nil {
+		return
+	}
+
 	actions := c.mapper(&message)
 	if len(actions) == 0 {
-		if message.Ack != nil {
-			message.Ack()
-		}
+		c.sendLocked(ctx, Message{Ack: message.Ack})
 		return
 	}
 
@@ -304,11 +249,39 @@ func (c *connector) sendMessage(message Message) {
 			OldData:        message.OldData,
 			NewData:        message.NewData,
 		}
-		// Only set Ack on the last action to ensure all queries complete before ack
+		// Only set Ack on the last action so all queries commit before ack.
 		if i == len(actions)-1 {
 			msg.Ack = message.Ack
 		}
-		c.messages <- msg
+		if !c.sendLocked(ctx, msg) {
+			return
+		}
+	}
+}
+
+// sendAcknowledgement queues a sink barrier so control and filtered events
+// cannot advance the source position past earlier unapplied writes.
+func (c *connector) sendAcknowledgement(ack func() error) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	ctx := c.processingContext()
+	if ctx.Err() != nil {
+		return
+	}
+	c.sendLocked(ctx, Message{Ack: ack})
+}
+
+// sendLocked holds sendMu. It blocks until the message is accepted or the
+// processing context is cancelled (during shutdown), avoiding send panics.
+func (c *connector) sendLocked(ctx context.Context, message Message) bool {
+	if c.messages == nil {
+		return true
+	}
+	select {
+	case c.messages <- message:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 

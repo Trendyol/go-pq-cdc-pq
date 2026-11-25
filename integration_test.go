@@ -5,11 +5,14 @@ package gopqcdcpq
 import (
 	"context"
 	"fmt"
+	"net"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/Trendyol/go-pq-cdc-pq/config"
 	cdcconfig "github.com/Trendyol/go-pq-cdc/config"
+	"github.com/Trendyol/go-pq-cdc/pq"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -27,8 +30,12 @@ const (
 
 // setupPostgresContainer creates a PostgreSQL container for testing
 func setupPostgresContainer(ctx context.Context, t *testing.T, name string) (testcontainers.Container, string, int) {
+	image := os.Getenv("POSTGRES_TEST_IMAGE")
+	if image == "" {
+		image = "postgres:16"
+	}
 	req := testcontainers.ContainerRequest{
-		Image:        "postgres:16",
+		Image:        image,
 		ExposedPorts: []string{"5432/tcp"},
 		Env: map[string]string{
 			"POSTGRES_USER":             testDBUser,
@@ -145,6 +152,146 @@ func createIntegrationTestConfig(sourceHost string, sourcePort int, targetHost s
 			},
 		},
 	}
+}
+
+// TestIntegrationInsertReplication tests that inserts are replicated from source to target
+func TestIntegrationTargetUnavailableAtStartupDoesNotCreateSourceSlot(t *testing.T) {
+	if testing.Short() {
+		t.Skip(skipIntegrationTestMsg)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sourceContainer, sourceHost, sourcePort := setupPostgresContainer(ctx, t, "")
+	t.Cleanup(func() { require.NoError(t, sourceContainer.Terminate(context.Background())) })
+	targetContainer, targetHost, targetPort := setupPostgresContainer(ctx, t, "")
+	t.Cleanup(func() { require.NoError(t, targetContainer.Terminate(context.Background())) })
+
+	cfg := createIntegrationTestConfig(sourceHost, sourcePort, targetHost, targetPort)
+	cfg.BatchConfig = config.BatchConfig{
+		BulkSize: 1, Timeout: 25 * time.Millisecond, MaxRetries: 2,
+		RetryDelay: 10 * time.Millisecond, ApplyTimeout: 250 * time.Millisecond,
+	}
+	require.NoError(t, targetContainer.Stop(ctx, nil))
+
+	conn, err := NewConnector(ctx, cfg)
+	require.ErrorContains(t, err, "target database")
+	require.Nil(t, conn)
+
+	source, err := pgxpool.New(ctx, getConnectionString(sourceHost, sourcePort))
+	require.NoError(t, err)
+	defer source.Close()
+	var slots int
+	require.NoError(t, source.QueryRow(ctx,
+		"SELECT count(*) FROM pg_replication_slots WHERE slot_name=$1", cfg.CDC.Slot.Name,
+	).Scan(&slots))
+	require.Zero(t, slots, "target connectivity must be validated before source slot initialization")
+}
+
+// TestIntegrationExhaustedOutagePreservesLSNAndReplaysSameSlot verifies that the
+// connector never advances the source acknowledgement past a batch it could not
+// apply to the target. After retries are exhausted the process stops (fail
+// closed); a supervisor restarting on the SAME slot replays the missed WAL.
+func TestIntegrationExhaustedOutagePreservesLSNAndReplaysSameSlot(t *testing.T) {
+	if testing.Short() {
+		t.Skip(skipIntegrationTestMsg)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	sourceContainer, sourceHost, sourcePort := setupPostgresContainer(ctx, t, "")
+	t.Cleanup(func() { require.NoError(t, sourceContainer.Terminate(context.Background())) })
+	targetContainer, targetHost, targetPort := setupPostgresContainer(ctx, t, "")
+	t.Cleanup(func() { require.NoError(t, targetContainer.Terminate(context.Background())) })
+
+	source, err := pgxpool.New(ctx, getConnectionString(sourceHost, sourcePort))
+	require.NoError(t, err)
+	t.Cleanup(source.Close)
+	target, err := pgxpool.New(ctx, getConnectionString(targetHost, targetPort))
+	require.NoError(t, err)
+	t.Cleanup(target.Close)
+	for _, pool := range []*pgxpool.Pool{source, target} {
+		_, err = pool.Exec(ctx, "CREATE TABLE users (id integer PRIMARY KEY, name text NOT NULL, email text)")
+		require.NoError(t, err)
+	}
+
+	cfg := createIntegrationTestConfig(sourceHost, sourcePort, targetHost, targetPort)
+	cfg.BatchConfig = config.BatchConfig{
+		BulkSize: 1, Timeout: 25 * time.Millisecond, MaxRetries: 2,
+		RetryDelay: 25 * time.Millisecond, ApplyTimeout: 500 * time.Millisecond,
+	}
+	cfg.CDC.Metric.Port = unusedIntegrationPort(t)
+
+	startConnector := func() *connector {
+		api, createErr := NewConnector(ctx, cfg)
+		require.NoError(t, createErr)
+		conn := api.(*connector)
+		api.Start(ctx)
+		readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
+		defer readyCancel()
+		require.NoError(t, conn.waitUntilReady(readyCtx))
+		return conn
+	}
+
+	conn := startConnector()
+	tx, err := source.Begin(ctx)
+	require.NoError(t, err)
+	_, err = tx.Exec(ctx, insertUserSQL, 1, "baseline", "baseline@example.com")
+	require.NoError(t, err)
+	var insertedLSN string
+	require.NoError(t, tx.QueryRow(ctx, "SELECT pg_current_wal_insert_lsn()::text").Scan(&insertedLSN))
+	require.NoError(t, tx.Commit(ctx))
+	baselineLSN, err := pq.ParseLSN(insertedLSN)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		confirmed, queryErr := confirmedFlushLSN(ctx, source, cfg.CDC.Slot.Name)
+		if queryErr != nil {
+			return false
+		}
+		parsed, parseErr := pq.ParseLSN(confirmed)
+		return parseErr == nil && parsed > baselineLSN
+	}, 15*time.Second, 25*time.Millisecond)
+	confirmedBaseline, err := confirmedFlushLSN(ctx, source, cfg.CDC.Slot.Name)
+	require.NoError(t, err)
+
+	require.NoError(t, targetContainer.Stop(ctx, nil))
+	_, err = source.Exec(ctx, insertUserSQL, 2, "pending-2", "pending-2@example.com")
+	require.NoError(t, err)
+	_, err = source.Exec(ctx, insertUserSQL, 3, "pending-3", "pending-3@example.com")
+	require.NoError(t, err)
+
+	failureCtx, failureCancel := context.WithTimeout(ctx, 15*time.Second)
+	err = conn.WaitForShutdown(failureCtx)
+	failureCancel()
+	require.ErrorContains(t, err, "target apply failed")
+	conn.Close()
+	confirmedAfterFailure, err := confirmedFlushLSN(ctx, source, cfg.CDC.Slot.Name)
+	require.NoError(t, err)
+	require.Equal(t, confirmedBaseline, confirmedAfterFailure, "retry exhaustion must not advance source acknowledgement")
+
+	require.NoError(t, targetContainer.Start(ctx))
+	require.Eventually(t, func() bool { return target.Ping(ctx) == nil }, 15*time.Second, 50*time.Millisecond)
+	conn = startConnector()
+	defer conn.Close()
+	require.Eventually(t, func() bool {
+		var ids []int
+		queryErr := target.QueryRow(ctx, "SELECT coalesce(array_agg(id ORDER BY id), '{}'::integer[]) FROM users").Scan(&ids)
+		return queryErr == nil && len(ids) == 3 && ids[0] == 1 && ids[1] == 2 && ids[2] == 3
+	}, 20*time.Second, 50*time.Millisecond)
+}
+
+func confirmedFlushLSN(ctx context.Context, source *pgxpool.Pool, slot string) (string, error) {
+	var lsn string
+	err := source.QueryRow(ctx, "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&lsn)
+	return lsn, err
+}
+
+func unusedIntegrationPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port
 }
 
 // TestIntegrationInsertReplication tests that inserts are replicated from source to target
