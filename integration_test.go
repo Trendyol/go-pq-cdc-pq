@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
 	"testing"
 	"time"
 
@@ -30,12 +29,8 @@ const (
 
 // setupPostgresContainer creates a PostgreSQL container for testing
 func setupPostgresContainer(ctx context.Context, t *testing.T, name string) (testcontainers.Container, string, int) {
-	image := os.Getenv("POSTGRES_TEST_IMAGE")
-	if image == "" {
-		image = "postgres:16"
-	}
 	req := testcontainers.ContainerRequest{
-		Image:        image,
+		Image:        "postgres:16",
 		ExposedPorts: []string{"5432/tcp"},
 		Env: map[string]string{
 			"POSTGRES_USER":             testDBUser,
@@ -154,40 +149,6 @@ func createIntegrationTestConfig(sourceHost string, sourcePort int, targetHost s
 	}
 }
 
-// TestIntegrationInsertReplication tests that inserts are replicated from source to target
-func TestIntegrationTargetUnavailableAtStartupDoesNotCreateSourceSlot(t *testing.T) {
-	if testing.Short() {
-		t.Skip(skipIntegrationTestMsg)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	sourceContainer, sourceHost, sourcePort := setupPostgresContainer(ctx, t, "")
-	t.Cleanup(func() { require.NoError(t, sourceContainer.Terminate(context.Background())) })
-	targetContainer, targetHost, targetPort := setupPostgresContainer(ctx, t, "")
-	t.Cleanup(func() { require.NoError(t, targetContainer.Terminate(context.Background())) })
-
-	cfg := createIntegrationTestConfig(sourceHost, sourcePort, targetHost, targetPort)
-	cfg.BatchConfig = config.BatchConfig{
-		BulkSize: 1, Timeout: 25 * time.Millisecond, MaxRetries: 2,
-		RetryDelay: 10 * time.Millisecond, ApplyTimeout: 250 * time.Millisecond,
-	}
-	require.NoError(t, targetContainer.Stop(ctx, nil))
-
-	conn, err := NewConnector(ctx, cfg)
-	require.ErrorContains(t, err, "target database")
-	require.Nil(t, conn)
-
-	source, err := pgxpool.New(ctx, getConnectionString(sourceHost, sourcePort))
-	require.NoError(t, err)
-	defer source.Close()
-	var slots int
-	require.NoError(t, source.QueryRow(ctx,
-		"SELECT count(*) FROM pg_replication_slots WHERE slot_name=$1", cfg.CDC.Slot.Name,
-	).Scan(&slots))
-	require.Zero(t, slots, "target connectivity must be validated before source slot initialization")
-}
-
 // TestIntegrationExhaustedOutagePreservesLSNAndReplaysSameSlot verifies that the
 // connector never advances the source acknowledgement past a batch it could not
 // apply to the target. After retries are exhausted the process stops (fail
@@ -218,7 +179,7 @@ func TestIntegrationExhaustedOutagePreservesLSNAndReplaysSameSlot(t *testing.T) 
 	cfg := createIntegrationTestConfig(sourceHost, sourcePort, targetHost, targetPort)
 	cfg.BatchConfig = config.BatchConfig{
 		BulkSize: 1, Timeout: 25 * time.Millisecond, MaxRetries: 2,
-		RetryDelay: 25 * time.Millisecond, ApplyTimeout: 500 * time.Millisecond,
+		RetryDelay: 25 * time.Millisecond,
 	}
 	cfg.CDC.Metric.Port = unusedIntegrationPort(t)
 
@@ -226,10 +187,10 @@ func TestIntegrationExhaustedOutagePreservesLSNAndReplaysSameSlot(t *testing.T) 
 		api, createErr := NewConnector(ctx, cfg)
 		require.NoError(t, createErr)
 		conn := api.(*connector)
-		api.Start(ctx)
+		go api.Start(ctx)
 		readyCtx, readyCancel := context.WithTimeout(ctx, 15*time.Second)
 		defer readyCancel()
-		require.NoError(t, conn.waitUntilReady(readyCtx))
+		require.NoError(t, conn.cdc.WaitUntilReady(readyCtx))
 		return conn
 	}
 

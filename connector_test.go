@@ -2,6 +2,7 @@ package gopqcdcpq
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/Trendyol/go-pq-cdc/pq/message/tuple"
 	"github.com/Trendyol/go-pq-cdc/pq/replication"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -41,6 +43,13 @@ func createTestConfig() *config.Connector {
 	}
 }
 
+func TestNewConnectorSuccess(t *testing.T) {
+	// We can't easily test NewConnector without actual database connection
+	// This test would require integration test setup
+	// For unit test, we'll test the connector methods with mocked dependencies
+	t.Skip("Requires database connection - use integration test")
+}
+
 func TestConnectorStart(t *testing.T) {
 	ctx := context.Background()
 	cfg := createTestConfig()
@@ -57,7 +66,6 @@ func TestConnectorStart(t *testing.T) {
 		defaultSchema: "public",
 		mapper:        DefaultMapper,
 	}
-	conn.initLifecycle()
 
 	// Create sink with mock pool
 	batchConfig := config.BatchConfig{
@@ -68,27 +76,12 @@ func TestConnectorStart(t *testing.T) {
 	}
 	conn.sink = NewSink(mockPool, batchConfig, nil)
 
-	// The new Start launches a source goroutine that calls WaitUntilReady,
-	// then Start, then cancels gracefully. Mock both upstream calls and the
-	// resources closed on graceful shutdown.
-	mockCDC.On("WaitUntilReady", mock.Anything).Return(nil).Once()
 	mockCDC.On("Start", mock.Anything).Return().Once()
-	mockCDC.On("Close").Return().Once()
-	mockPool.On("Close").Return().Once()
-
-	conn.Start(ctx)
-
-	// After the mocked CDC starts and becomes ready, Start's source goroutine
-	// cancels the run context, which triggers Close and closes c.stopped.
-	// WaitForShutdown returns once stopped; assert the connector shut down
-	// cleanly with no fatal error.
-	shutdownCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	err := conn.WaitForShutdown(shutdownCtx)
-	assert.NoError(t, err)
+	conn.Start(runCtx)
 
 	mockCDC.AssertExpectations(t)
-	mockPool.AssertExpectations(t)
 }
 
 func TestConnectorWaitForShutdownSignal(t *testing.T) {
@@ -107,6 +100,48 @@ func TestConnectorWaitForShutdownSignal(t *testing.T) {
 	// Context timeout is expected behavior, not an error
 	assert.Error(t, err)
 	assert.Equal(t, context.DeadlineExceeded, err)
+}
+
+func TestConnectorReportsTargetFailureWithoutAck(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	pool := &mocks.MockDatabasePool{}
+	results := &mocks.MockBatchResults{}
+	source := &mocks.MockCDCConnector{}
+	applyErr := errors.New("target unavailable")
+	results.On("Exec").Return(pgconn.CommandTag{}, applyErr).Once()
+	results.On("Close").Return(nil).Once()
+	pool.On("SendBatch", mock.Anything, mock.Anything).Return(results).Once()
+	source.On("Start", mock.Anything).Return().Once()
+	cfg := createTestConfig()
+	cfg.BatchConfig.BulkSize = 1
+	cfg.BatchConfig.MaxRetries = 1
+	conn := &connector{
+		cdc: source, messages: make(chan Message, 2), sinkFailure: make(chan error, 1),
+		sink: NewSink(pool, cfg.BatchConfig, nil),
+	}
+	acked := false
+	conn.messages <- Message{Query: "INSERT INTO users VALUES (1)", Ack: func() error {
+		acked = true
+		return nil
+	}}
+	conn.messages <- Message{Ack: func() error {
+		acked = true
+		return nil
+	}}
+	conn.Start(ctx)
+	assert.ErrorIs(t, conn.WaitForShutdown(ctx), applyErr)
+	assert.False(t, acked)
+	pool.AssertExpectations(t)
+	results.AssertExpectations(t)
+	source.AssertExpectations(t)
+}
+
+func TestConnectorSendCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	conn := &connector{messages: make(chan Message)}
+	assert.False(t, conn.send(ctx, Message{}))
 }
 
 func TestConnectorWaitForShutdownContextCancelled(t *testing.T) {
@@ -385,11 +420,9 @@ func TestConnectorProcessSnapshotDataMessage(t *testing.T) {
 func TestConnectorProcessSnapshotBeginAck(t *testing.T) {
 	ctx := context.Background()
 	cfg := createTestConfig()
-	messages := make(chan Message, 10)
 
 	conn := &connector{
-		cfg:      cfg,
-		messages: messages,
+		cfg: cfg,
 	}
 
 	ackCalled := false
@@ -404,29 +437,15 @@ func TestConnectorProcessSnapshotBeginAck(t *testing.T) {
 
 	conn.processSnapshotMessage(ctx, snapshotMsg, ack)
 
-	// Snapshot BEGIN acks are now deferred: they arrive as an ordered barrier
-	// in the message queue so they cannot advance the source LSN ahead of
-	// earlier pending target writes. ack must not be called immediately.
-	select {
-	case msg := <-messages:
-		assert.Empty(t, msg.Query, "barrier has no query")
-		assert.NotNil(t, msg.Ack, "barrier carries the deferred ack")
-		// Calling the barrier's Ack exercises the ordered-barrier path.
-		assert.NoError(t, msg.Ack())
-		assert.True(t, ackCalled, "ack should be called when the barrier is acked")
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal(msgNotReceived)
-	}
+	assert.True(t, ackCalled, "snapshot begin should be acked immediately")
 }
 
 func TestConnectorProcessSnapshotEndAck(t *testing.T) {
 	ctx := context.Background()
 	cfg := createTestConfig()
-	messages := make(chan Message, 10)
 
 	conn := &connector{
-		cfg:      cfg,
-		messages: messages,
+		cfg: cfg,
 	}
 
 	ackCalled := false
@@ -441,16 +460,7 @@ func TestConnectorProcessSnapshotEndAck(t *testing.T) {
 
 	conn.processSnapshotMessage(ctx, snapshotMsg, ack)
 
-	// Snapshot END acks are deferred as an ordered barrier.
-	select {
-	case msg := <-messages:
-		assert.Empty(t, msg.Query, "barrier has no query")
-		assert.NotNil(t, msg.Ack, "barrier carries the deferred ack")
-		assert.NoError(t, msg.Ack())
-		assert.True(t, ackCalled, "ack should be called when the barrier is acked")
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal(msgNotReceived)
-	}
+	assert.True(t, ackCalled, "snapshot end should be acked immediately")
 }
 
 func TestConnectorProcessMessageRelation(t *testing.T) {
@@ -567,7 +577,7 @@ func TestConnectorSendMessage(t *testing.T) {
 		Args:   []any{1, "test"},
 	}
 
-	conn.sendMessage(msg)
+	conn.sendMessage(context.Background(), msg)
 
 	select {
 	case received := <-messages:

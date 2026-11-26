@@ -10,16 +10,12 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// DefaultApplyTimeout bounds each target batch attempt and the startup target ping.
-const DefaultApplyTimeout = 30 * time.Second
-
-// BatchConfig holds configuration for batch processing.
+// BatchConfig holds configuration for batch processing
 type BatchConfig struct {
-	BulkSize     int           `yaml:"bulk_size"`
-	Timeout      time.Duration `yaml:"timeout"`
-	MaxRetries   int           `yaml:"max_retries"` // Total attempts, including the first.
-	RetryDelay   time.Duration `yaml:"retry_delay"`
-	ApplyTimeout time.Duration `yaml:"apply_timeout"`
+	BulkSize   int           `yaml:"bulk_size"`
+	Timeout    time.Duration `yaml:"timeout"`
+	MaxRetries int           `yaml:"max_retries"`
+	RetryDelay time.Duration `yaml:"retry_delay"`
 }
 
 // Connector represents the complete connector configuration
@@ -118,23 +114,6 @@ func (c *Connector) SetDefault() {
 		c.ConnectorConfig.SlotActivityCheckerInterval = 3 * time.Second
 	}
 
-	// Explicit batch settings win; legacy connector settings remain fallbacks.
-	if c.BatchConfig.BulkSize == 0 {
-		c.BatchConfig.BulkSize = c.ConnectorConfig.BulkSize
-	}
-	if c.BatchConfig.Timeout == 0 {
-		c.BatchConfig.Timeout = c.ConnectorConfig.Timeout
-	}
-	if c.BatchConfig.MaxRetries == 0 {
-		c.BatchConfig.MaxRetries = c.ConnectorConfig.MaxRetries
-	}
-	if c.BatchConfig.RetryDelay == 0 {
-		c.BatchConfig.RetryDelay = c.ConnectorConfig.RetryDelay
-	}
-	if c.BatchConfig.ApplyTimeout == 0 {
-		c.BatchConfig.ApplyTimeout = DefaultApplyTimeout
-	}
-
 	// Populate CDC config from Postgres source and Connector config
 	if c.CDC.Host == "" {
 		c.CDC.Host = c.Postgres.Source.Host
@@ -207,30 +186,10 @@ func (c *Connector) SetDefault() {
 	c.CDC.SetDefault()
 }
 
-// Validate checks settings required for safe target application, after SetDefault.
+// Validate rejects heartbeats that acknowledge changes outside the ordered target sink.
 func (c *Connector) Validate() error {
-	if c.ConnectorConfig.BulkSize <= 0 {
-		return fmt.Errorf("connector.bulk_size must be positive")
-	}
-	if err := c.BatchConfig.Validate(); err != nil {
-		return err
-	}
-	return nil
-}
-
-// Validate rejects batch settings that could skip execution or prevent shutdown.
-func (c BatchConfig) Validate() error {
-	switch {
-	case c.BulkSize <= 0:
-		return fmt.Errorf("batch.bulk_size must be positive")
-	case c.Timeout <= 0:
-		return fmt.Errorf("batch.timeout must be positive")
-	case c.MaxRetries <= 0:
-		return fmt.Errorf("batch.max_retries must be positive (total attempts, including the first)")
-	case c.RetryDelay <= 0:
-		return fmt.Errorf("batch.retry_delay must be positive (zero would busy-loop retries)")
-	case c.ApplyTimeout < 0:
-		return fmt.Errorf("batch.apply_timeout must not be negative (zero uses the default)")
+	if c.CDC.IsHeartbeatEnabled() {
+		return fmt.Errorf("cdc.heartbeat.table must be disabled: go-pq-cdc v1.11.14 auto-acks heartbeat events outside the ordered target sink, risking acknowledgment of unapplied changes")
 	}
 	return nil
 }

@@ -20,13 +20,8 @@ type Pool interface {
 	Close()
 }
 
-// NewTargetPool creates a target pool and verifies connectivity before
-// returning it, so a downstream supervisor can retry startup without the
-// source having created/advanced a replication slot against a dead target.
+// NewTargetPool creates a new database connection pool for the target database.
 func NewTargetPool(ctx context.Context, cfg *config.Connector) (Pool, error) {
-	if cfg == nil {
-		return nil, fmt.Errorf("connector configuration is required")
-	}
 	poolConfig, err := buildPGXConfig(cfg.Postgres.Target)
 	if err != nil {
 		return nil, fmt.Errorf("build pgx config: %w", err)
@@ -35,17 +30,6 @@ func NewTargetPool(ctx context.Context, cfg *config.Connector) (Pool, error) {
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return nil, fmt.Errorf("create pgx pool: %w", err)
-	}
-
-	applyTimeout := cfg.BatchConfig.ApplyTimeout
-	if applyTimeout <= 0 {
-		applyTimeout = config.DefaultApplyTimeout
-	}
-	pingCtx, cancel := context.WithTimeout(ctx, applyTimeout)
-	defer cancel()
-	if err := pool.Ping(pingCtx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("connect to target database: %w", err)
 	}
 
 	return &pgxPool{pool: pool}, nil
