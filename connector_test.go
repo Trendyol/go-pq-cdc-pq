@@ -2,6 +2,7 @@ package gopqcdcpq
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/Trendyol/go-pq-cdc/pq/message/format"
 	"github.com/Trendyol/go-pq-cdc/pq/message/tuple"
 	"github.com/Trendyol/go-pq-cdc/pq/replication"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 )
@@ -62,6 +64,7 @@ func TestConnectorStart(t *testing.T) {
 		pool:          mockPool,
 		primaryKey:    "id",
 		defaultSchema: "public",
+		mapper:        DefaultMapper,
 	}
 
 	// Create sink with mock pool
@@ -73,12 +76,10 @@ func TestConnectorStart(t *testing.T) {
 	}
 	conn.sink = NewSink(mockPool, batchConfig, nil)
 
-	mockCDC.On("Start", mock.Anything).Return()
-
-	conn.Start(ctx)
-
-	// Give goroutines time to start
-	time.Sleep(200 * time.Millisecond)
+	mockCDC.On("Start", mock.Anything).Return().Once()
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	conn.Start(runCtx)
 
 	mockCDC.AssertExpectations(t)
 }
@@ -99,6 +100,48 @@ func TestConnectorWaitForShutdownSignal(t *testing.T) {
 	// Context timeout is expected behavior, not an error
 	assert.Error(t, err)
 	assert.Equal(t, context.DeadlineExceeded, err)
+}
+
+func TestConnectorReportsTargetFailureWithoutAck(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	pool := &mocks.MockDatabasePool{}
+	results := &mocks.MockBatchResults{}
+	source := &mocks.MockCDCConnector{}
+	applyErr := errors.New("target unavailable")
+	results.On("Exec").Return(pgconn.CommandTag{}, applyErr).Once()
+	results.On("Close").Return(nil).Once()
+	pool.On("SendBatch", mock.Anything, mock.Anything).Return(results).Once()
+	source.On("Start", mock.Anything).Return().Once()
+	cfg := createTestConfig()
+	cfg.BatchConfig.BulkSize = 1
+	cfg.BatchConfig.MaxRetries = 1
+	conn := &connector{
+		cdc: source, messages: make(chan Message, 2), sinkFailure: make(chan error, 1),
+		sink: NewSink(pool, cfg.BatchConfig, nil),
+	}
+	acked := false
+	conn.messages <- Message{Query: "INSERT INTO users VALUES (1)", Ack: func() error {
+		acked = true
+		return nil
+	}}
+	conn.messages <- Message{Ack: func() error {
+		acked = true
+		return nil
+	}}
+	conn.Start(ctx)
+	assert.ErrorIs(t, conn.WaitForShutdown(ctx), applyErr)
+	assert.False(t, acked)
+	pool.AssertExpectations(t)
+	results.AssertExpectations(t)
+	source.AssertExpectations(t)
+}
+
+func TestConnectorSendCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	conn := &connector{messages: make(chan Message)}
+	assert.False(t, conn.send(ctx, Message{}))
 }
 
 func TestConnectorWaitForShutdownContextCancelled(t *testing.T) {
@@ -423,9 +466,11 @@ func TestConnectorProcessSnapshotEndAck(t *testing.T) {
 func TestConnectorProcessMessageRelation(t *testing.T) {
 	ctx := context.Background()
 	cfg := createTestConfig()
+	messages := make(chan Message, 10)
 
 	conn := &connector{
-		cfg: cfg,
+		cfg:      cfg,
+		messages: messages,
 	}
 
 	ackCalled := false
@@ -447,15 +492,26 @@ func TestConnectorProcessMessageRelation(t *testing.T) {
 
 	conn.processMessage(ctx, replCtx)
 
-	assert.True(t, ackCalled, "ack should be called for relation messages")
+	// Relation acks are deferred behind earlier target writes via a barrier.
+	select {
+	case msg := <-messages:
+		assert.Empty(t, msg.Query, "relation barrier has no query")
+		assert.NotNil(t, msg.Ack, "relation barrier carries the deferred ack")
+		assert.NoError(t, msg.Ack())
+		assert.True(t, ackCalled, "ack should be called when the barrier is acked")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal(msgNotReceived)
+	}
 }
 
 func TestConnectorProcessMessageRelationNilAck(t *testing.T) {
 	ctx := context.Background()
 	cfg := createTestConfig()
+	messages := make(chan Message, 10)
 
 	conn := &connector{
-		cfg: cfg,
+		cfg:      cfg,
+		messages: messages,
 	}
 
 	relationMsg := &format.Relation{
@@ -469,10 +525,18 @@ func TestConnectorProcessMessageRelationNilAck(t *testing.T) {
 		Ack:     nil,
 	}
 
-	// Should not panic
+	// Should not panic and should still queue a barrier with a nil ack.
 	assert.NotPanics(t, func() {
 		conn.processMessage(ctx, replCtx)
 	})
+
+	select {
+	case msg := <-messages:
+		assert.Empty(t, msg.Query, "relation barrier has no query")
+		assert.Nil(t, msg.Ack, "nil ack is passed through unmodified")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal(msgNotReceived)
+	}
 }
 
 func TestConnectorProcessMessageUnknownType(t *testing.T) {
@@ -513,7 +577,7 @@ func TestConnectorSendMessage(t *testing.T) {
 		Args:   []any{1, "test"},
 	}
 
-	conn.sendMessage(msg)
+	conn.sendMessage(context.Background(), msg)
 
 	select {
 	case received := <-messages:
@@ -935,15 +999,18 @@ func TestConnectorWithCustomMapperFilterEvent(t *testing.T) {
 
 	conn.processMessage(ctx, replCtx)
 
-	// No message should be sent, but ack should be called
+	// A filtered event emits no target query, but sendMessage still queues an
+	// ordered barrier (empty Query, non-nil Ack) so the source LSN cannot
+	// advance past earlier pending writes. ack is deferred behind the barrier.
 	select {
-	case <-messages:
-		t.Fatal("message should not be sent for filtered event")
-	case <-time.After(50 * time.Millisecond):
-		// Expected: no message
+	case msg := <-messages:
+		assert.Empty(t, msg.Query, "filtered event should queue a barrier, not a query")
+		assert.NotNil(t, msg.Ack, "barrier carries the deferred ack")
+		assert.NoError(t, msg.Ack())
+		assert.True(t, ackCalled, "ack should be called when the barrier is acked")
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal(msgNotReceived)
 	}
-
-	assert.True(t, ackCalled, "ack should be called for filtered events")
 }
 
 func TestConnectorWithCustomMapperTransformData(t *testing.T) {

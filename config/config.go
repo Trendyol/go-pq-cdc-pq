@@ -186,5 +186,13 @@ func (c *Connector) SetDefault() {
 	c.CDC.SetDefault()
 }
 
+// Validate rejects heartbeats that acknowledge changes outside the ordered target sink.
+func (c *Connector) Validate() error {
+	if c.CDC.IsHeartbeatEnabled() {
+		return fmt.Errorf("cdc.heartbeat.table must be disabled: go-pq-cdc v1.11.14 auto-acks heartbeat events outside the ordered target sink, risking acknowledgment of unapplied changes")
+	}
+	return nil
+}
+
 // Config is an alias for Connector to maintain backward compatibility
 type Config = Connector

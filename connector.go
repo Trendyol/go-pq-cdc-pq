@@ -32,10 +32,16 @@ type connector struct {
 	primaryKey    string
 	defaultSchema string
 	mapper        Mapper
+
+	// sinkFailure reports the terminal target failure to WaitForShutdown.
+	sinkFailure chan error
 }
 
 func NewConnector(ctx context.Context, cfg *config.Connector, options ...Option) (Connector, error) {
 	cfg.SetDefault()
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid connector configuration: %w", err)
+	}
 
 	// Apply options
 	opts := defaultConfig()
@@ -48,6 +54,7 @@ func NewConnector(ctx context.Context, cfg *config.Connector, options ...Option)
 		primaryKey:    opts.PrimaryKey,
 		defaultSchema: opts.DefaultSchema,
 		mapper:        opts.Mapper,
+		sinkFailure:   make(chan error, 1),
 	}
 
 	// Initialize database pool for target database
@@ -92,19 +99,9 @@ func (c *connector) Start(ctx context.Context) {
 
 		// Start sink
 		sinkCtx := slogctx.Append(ctx, "component", "Sink")
-		// Convert Message channel to pqconnector.Message channel
-		pqMessages := make(chan Message, cap(c.messages))
-		go func() {
-			for msg := range c.messages {
-				pqMessages <- Message{
-					Query: msg.Query,
-					Args:  msg.Args,
-					Ack:   msg.Ack,
-				}
-			}
-			close(pqMessages)
-		}()
-		go c.sink.Start(sinkCtx, pqMessages)
+		if err := c.sink.Start(sinkCtx, c.messages); err != nil && ctx.Err() == nil {
+			c.sinkFailure <- err
+		}
 	}()
 
 	c.cdc.Start(ctx)
@@ -114,8 +111,11 @@ func (c *connector) WaitForShutdown(ctx context.Context) error {
 	log := slogctx.FromCtx(ctx)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 
 	select {
+	case err := <-c.sinkFailure:
+		return err
 	case sig := <-sigChan:
 		log.Info("shutdown signal received", "signal", sig.String())
 		return nil
@@ -132,14 +132,18 @@ func (c *connector) Close() {
 	}
 }
 
-func (c *connector) listener(ctx *replication.ListenerContext) {
+func (c *connector) listener(replCtx *replication.ListenerContext) {
 	// Handle keepalive messages
-	if ctx.Message == nil {
+	if replCtx == nil || replCtx.Message == nil {
 		return
 	}
 
 	// Process the message
-	c.processMessage(context.Background(), ctx)
+	ctx := replCtx.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c.processMessage(ctx, replCtx)
 }
 
 func (c *connector) processMessage(ctx context.Context, replCtx *replication.ListenerContext) {
@@ -161,13 +165,12 @@ func (c *connector) processMessage(ctx context.Context, replCtx *replication.Lis
 		c.processSnapshotMessage(ctx, msg, replCtx.Ack)
 
 	case *format.Relation:
+		// Control metadata is acknowledged only behind earlier target writes.
 		log.Debug("Relation message received",
 			"namespace", msg.Namespace,
 			"table", msg.Name,
 			"columns", len(msg.Columns))
-		if replCtx.Ack != nil {
-			replCtx.Ack()
-		}
+		c.sendAcknowledgement(ctx, replCtx.Ack)
 
 	default:
 		log.Warn("Unknown message type received",
@@ -191,7 +194,7 @@ func (c *connector) processInsertMessage(ctx context.Context, msg *format.Insert
 	msgObj.OldKeys = nil
 	msgObj.NewValues = msg.Decoded
 
-	c.sendMessage(*msgObj)
+	c.sendMessage(ctx, *msgObj)
 
 }
 
@@ -209,7 +212,7 @@ func (c *connector) processDeleteMessage(ctx context.Context, msg *format.Delete
 	msgObj.OldKeys = msg.OldDecoded
 	msgObj.NewValues = nil
 
-	c.sendMessage(*msgObj)
+	c.sendMessage(ctx, *msgObj)
 
 }
 
@@ -247,7 +250,7 @@ func (c *connector) processSnapshotMessage(ctx context.Context, msg *format.Snap
 		msgObj.Action = "SNAPSHOT"
 		msgObj.OldKeys = nil
 		msgObj.NewValues = msg.Data
-		c.sendMessage(*msgObj)
+		c.sendMessage(ctx, *msgObj)
 		return
 
 	default:
@@ -275,16 +278,17 @@ func (c *connector) processUpdateMessage(ctx context.Context, msg *format.Update
 	msgObj.OldKeys = msg.OldDecoded
 	msgObj.NewValues = msg.NewDecoded
 
-	c.sendMessage(*msgObj)
+	c.sendMessage(ctx, *msgObj)
 
 }
 
-func (c *connector) sendMessage(message Message) {
+// sendMessage applies the mapper and queues the resulting actions in order,
+// attaching the acknowledgement to the final action. An empty action set
+// becomes an ordered barrier so the event cannot acknowledge past pending writes.
+func (c *connector) sendMessage(ctx context.Context, message Message) {
 	actions := c.mapper(&message)
 	if len(actions) == 0 {
-		if message.Ack != nil {
-			message.Ack()
-		}
+		c.sendAcknowledgement(ctx, message.Ack)
 		return
 	}
 
@@ -308,7 +312,25 @@ func (c *connector) sendMessage(message Message) {
 		if i == len(actions)-1 {
 			msg.Ack = message.Ack
 		}
-		c.messages <- msg
+		if !c.send(ctx, msg) {
+			return
+		}
+	}
+}
+
+// sendAcknowledgement queues a sink barrier so control and filtered events
+// cannot advance the source position past earlier unapplied writes.
+func (c *connector) sendAcknowledgement(ctx context.Context, ack func() error) {
+	c.send(ctx, Message{Ack: ack})
+}
+
+// send allows the upstream callback to exit when ingestion is cancelled.
+func (c *connector) send(ctx context.Context, message Message) bool {
+	select {
+	case c.messages <- message:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
